@@ -4,6 +4,7 @@ pub mod display;
 mod engine;
 mod error;
 pub mod hal;
+pub mod pairing;
 pub mod tick;
 
 pub use engine::Engine;
