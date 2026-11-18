@@ -3,7 +3,7 @@
 use crate::{Error, Result};
 
 /// 기본 틱 간격.
-pub const TICK_MS: u32 = 20;
+pub const TICK_MS: u32 = 16;
 /// 한 루프에서 따라잡을 수 있는 최대 틱 수.
 pub const MAX_TICKS_PER_LOOP: u32 = 3;
 
