@@ -1,0 +1,18 @@
+[package]
+name = "dotbox-cli"
+description = "DotBox 게임 개발 명령줄 도구"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[[bin]]
+name = "dotbox"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.6.8", features = ["derive"] }
+dotbox-tools.workspace = true
+
+[dev-dependencies]
+serde_json = "1.0.154"
+tempfile = "3.27.0"

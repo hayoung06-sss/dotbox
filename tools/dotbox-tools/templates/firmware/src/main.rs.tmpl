@@ -1,0 +1,5 @@
+//! ESP32 펌웨어. 두 모듈(왼쪽/오른쪽)에 같은 이미지를 굽고, 역할은 `dotbox flash --side`가 기록한다.
+
+fn main() {
+    dotbox_esp::run({{crate}}::engine());
+}

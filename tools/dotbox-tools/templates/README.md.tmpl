@@ -1,0 +1,20 @@
+# {{name}}
+
+DotBox 게임입니다. [DotBox Engine](https://github.com/hayoung06-sss/dotbox)으로 만들었습니다.
+
+## 실행
+
+```sh
+dotbox run                  # PC 시뮬레이터로 실행
+dotbox doctor               # 개발 환경 점검
+dotbox flash --side both    # 두 모듈에 펌웨어를 굽는다
+dotbox monitor --side left  # 시리얼 로그 보기
+```
+
+## 구조
+
+- `game/`: 게임 로직. 플랫폼을 모르고 `dotbox-core`에만 의존한다.
+- `sim/`: PC 시뮬레이터 실행 파일.
+- `firmware/`: ESP32 펌웨어. ESP 툴체인으로 따로 빌드한다.
+- `assets/`: 원본 에셋.
+- `.dotbox/`: 개인 설정(시리얼 포트 등). 커밋하지 않는다.

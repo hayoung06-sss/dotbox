@@ -1,0 +1,14 @@
+[workspace]
+resolver = "3"
+members = ["game", "sim"]
+# 펌웨어는 ESP 툴체인과 target이 달라 호스트 workspace에서 뺀다.
+exclude = ["firmware"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+{{name}} = { path = "game" }
+dotbox-core = {{core_dep}}
+dotbox-sim = {{sim_dep}}

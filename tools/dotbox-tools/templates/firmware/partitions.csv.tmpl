@@ -1,0 +1,6 @@
+# Name,   Type, SubType, Offset,  Size
+nvs,      data, nvs,     0x9000,  0x6000
+phy_init, data, phy,     0xf000,  0x1000
+# 모듈 역할 레코드 (DotBox docs/pairing.md 2.1). 펌웨어를 다시 구워도 지워지지 않는다.
+dotbox,   data, 0x40,    0x10000, 0x1000
+factory,  app,  factory, 0x20000, 0x3E0000

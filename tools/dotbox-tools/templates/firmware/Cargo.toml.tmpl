@@ -1,0 +1,23 @@
+[package]
+name = "{{name}}-firmware"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "{{name}}-firmware"
+harness = false
+
+[dependencies]
+{{name}} = { path = "../game" }
+dotbox-esp = {{esp_dep}}
+
+[build-dependencies]
+embuild = "0.33"
+
+[profile.release]
+opt-level = "s"
+
+[profile.dev]
+debug = true
+opt-level = "z"

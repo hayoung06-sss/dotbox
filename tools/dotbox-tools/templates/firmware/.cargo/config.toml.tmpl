@@ -1,0 +1,16 @@
+[build]
+target = "xtensa-esp32-espidf"
+{{target_dir_line}}
+[target.xtensa-esp32-espidf]
+linker = "ldproxy"
+runner = "espflash flash --monitor"
+rustflags = ["--cfg", "espidf_time64"]
+
+[unstable]
+build-std = ["std", "panic_abort"]
+
+[env]
+MCU = "esp32"
+ESP_IDF_VERSION = "v5.3.3"
+# ESP-IDF 도구 설치 위치. 경로에 한글, 공백, OneDrive가 있으면 빌드가 실패한다.
+ESP_IDF_TOOLS_INSTALL_DIR = "{{idf_tools_dir}}"

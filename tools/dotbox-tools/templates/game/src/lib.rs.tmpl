@@ -1,0 +1,16 @@
+//! {{name}} 게임 로직. 플랫폼(시뮬레이터, ESP32)을 모르고 dotbox-core에만 의존한다.
+
+use dotbox_core::Engine;
+
+/// 이 게임을 담은 엔진을 만든다. 시뮬레이터(`sim`)와 펌웨어(`firmware`)가 함께 쓴다.
+pub fn engine() -> Engine {
+    Engine::new()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn engine_can_be_created() {
+        let _engine = super::engine();
+    }
+}
