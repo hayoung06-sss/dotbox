@@ -34,3 +34,11 @@
   - `ScreenLayout::Mirrored`: 16×16 화면을 두 패널에 똑같이 표시
   - `copy_panel(side, out)`으로 각 모듈이 자기 패널의 16×16 픽셀을 꺼낸다
 - `dotbox-core::tick`: 고정 틱 스케줄러 `FixedTicker`(`TICK_MS` 20, 루프당 최대 3틱, 밀린 시간 폐기, 시계 순환 처리)
+- `dotbox-core::pairing`: 모듈 역할 레코드 `RoleRecord`(16바이트, CRC32). 펌웨어와 `dotbox flash`가 함께 쓴다
+- `dotbox` CLI(`tools/dotbox-cli`)와 구현 라이브러리 `dotbox-tools`. 명세는 `docs/cli.md`
+  - `dotbox new`: 게임 프로젝트(game, sim, firmware, assets, `dotbox.toml`) 생성
+  - `dotbox doctor`: Rust·ESP 툴체인, 경로(한글·공백·OneDrive·길이), 펌웨어 target-dir, 엔진 버전 점검. `--json` 지원
+  - `dotbox run`: 시뮬레이터 실행
+  - `dotbox build`, `dotbox flash --side left|right|both`, `dotbox monitor`: 펌웨어 빌드, 굽기와 역할 기록, 시리얼 모니터.
+    `dotbox-esp`가 아직 없어 실기기 경로는 검증 전이다
+  - `dotbox studio`: PATH의 `dotbox-studio` 실행
