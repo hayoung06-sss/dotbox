@@ -1,5 +1,6 @@
 //! 하드웨어 독립 DotBox 엔진.
 
+pub mod display;
 mod engine;
 mod error;
 pub mod hal;
