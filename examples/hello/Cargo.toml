@@ -1,0 +1,9 @@
+[package]
+name = "hello"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+dotbox-core.workspace = true
+dotbox-sim.workspace = true

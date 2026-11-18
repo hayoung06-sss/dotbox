@@ -1,0 +1,12 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "examples/*"]
+exclude = ["platform/dotbox-esp"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+dotbox-core = { path = "crates/dotbox-core" }
+dotbox-sim = { path = "crates/dotbox-sim" }
