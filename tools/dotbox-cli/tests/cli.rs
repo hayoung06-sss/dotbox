@@ -229,9 +229,13 @@ fn new_then_run_then_doctor() {
     let run = dotbox()
         .current_dir(&root)
         .args(["run", "-q"])
+        // 창 없이 짧게 돌리고 끝낸다(dotbox_sim::HEADLESS_ENV).
+        .env("DOTBOX_SIM_HEADLESS_MS", "300")
         .output()
         .unwrap();
     assert!(run.status.success(), "{}", stderr(&run));
+    // 마스터와 슬레이브 엔진이 연결까지 갔다.
+    assert!(stderr(&run).contains("Connected"), "{}", stderr(&run));
     assert!(root.join("Cargo.lock").is_file());
 
     // 생성된 게임의 자체 테스트도 통과한다.

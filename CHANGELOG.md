@@ -23,9 +23,10 @@
 ### Added
 
 - Cargo 워크스페이스 구성: `crates/*`, `examples/*`
-- `dotbox-core`: 엔진 본체 crate와 `Engine` 골격
-- `dotbox-sim`: PC 실행기 라이브러리와 `run(engine)` 골격
-- `examples/hello`: 엔진 동작 확인용 최소 예제
+- `dotbox-core`: 엔진 본체 crate
+- `dotbox-sim`: PC 실행기 `run(make_games)`. 마스터·슬레이브 엔진 두 개를 메모리 링크로 이어 한 창에 두 패널을 그린다.
+  키보드 P1 WASD+Space, P2 방향키+Enter, F2 링크 끊기/잇기. `DOTBOX_SIM_HEADLESS_MS`로 창 없이 실행
+- `examples/hello`: 두 플레이어가 각자 점을 움직이는 2인 예제
 - README에 사용 방법 섹션 추가
 - `dotbox-core`: 공통 오류 `Error`와 `Result`
 - `dotbox-core::hal`: 하드웨어 트레잇 `Clock`, `Display`, `InputSource`, `Buzzer`, `Link`, `Storage`와 `Rgb`, `RawInput`
@@ -33,10 +34,18 @@
   - `ScreenLayout::Wide`(기본): 32×16 화면을 두 패널에 나눠 표시
   - `ScreenLayout::Mirrored`: 16×16 화면을 두 패널에 똑같이 표시
   - `copy_panel(side, out)`으로 각 모듈이 자기 패널의 16×16 픽셀을 꺼낸다
-- `dotbox-core::tick`: 고정 틱 스케줄러 `FixedTicker`(`TICK_MS` 20, 루프당 최대 3틱, 밀린 시간 폐기, 시계 순환 처리)
+- `dotbox-core::tick`: 고정 틱 스케줄러 `FixedTicker`(`TICK_MS` 16, 루프당 최대 3틱, 밀린 시간 폐기, 시계 순환 처리)
+- `dotbox-core` 게임 API(`docs/game-api.md`)
+  - `Game` 트레잇(`config`, `init`, `update`, `render`)과 `GameConfig`, `Context`(난수, 효과음, 레이아웃, `exit`)
+  - `Games`: 펌웨어 하나에 여러 게임 등록. 게임이 하나면 메뉴 없이 바로 시작
+  - `GameState`와 고정 버퍼 직렬화 `StateWriter`/`StateReader`(최대 200바이트)
+  - 입력: `Input`/`PlayerInput`(4방향, 아날로그, 버튼 이벤트), 중립 보정·데드존·히스테리시스·디바운스
+  - `Engine::step`: 마스터/슬레이브 루프, 핸드셰이크(빌드 일치 확인), `Input`/`State` 메시지, 연결 끊김 감지
+  - 효과음 `Note`/`Sound`, 모듈 간 메시지 형식 `protocol`
+  - `testing`: 화면 없이 게임을 돌리는 `Harness`, 메모리 링크 `loopback_pair`, 가짜 장치
 - `dotbox-core::pairing`: 모듈 역할 레코드 `RoleRecord`(16바이트, CRC32). 펌웨어와 `dotbox flash`가 함께 쓴다
 - `dotbox` CLI(`tools/dotbox-cli`)와 구현 라이브러리 `dotbox-tools`. 명세는 `docs/cli.md`
-  - `dotbox new`: 게임 프로젝트(game, sim, firmware, assets, `dotbox.toml`) 생성
+  - `dotbox new`: 게임 프로젝트(game, sim, firmware, assets, `dotbox.toml`) 생성. 게임 템플릿은 `Game` 구현과 테스트를 포함
   - `dotbox doctor`: Rust·ESP 툴체인, 경로(한글·공백·OneDrive·길이), 펌웨어 target-dir, 엔진 버전 점검. `--json` 지원
   - `dotbox run`: 시뮬레이터 실행
   - `dotbox build`, `dotbox flash --side left|right|both`, `dotbox monitor`: 펌웨어 빌드, 굽기와 역할 기록, 시리얼 모니터.

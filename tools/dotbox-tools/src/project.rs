@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::manifest::{MANIFEST_FILE, Manifest, crate_ident, validate_name};
+use crate::manifest::{MANIFEST_FILE, Manifest, crate_ident, type_ident, validate_name};
 use crate::paths::{PROJECT_PATH_MAX_CHARS, path_issues};
 use crate::process::to_forward_slashes;
 use crate::{Error, Result};
@@ -166,6 +166,7 @@ fn render(template: &str, context: &TemplateContext) -> String {
     template
         .replace("{{name}}", &context.name)
         .replace("{{crate}}", &crate_ident(&context.name))
+        .replace("{{type}}", &type_ident(&context.name))
         .replace(
             "{{core_dep}}",
             &context.engine.dependency("crates/dotbox-core"),
@@ -347,8 +348,9 @@ mod tests {
     #[test]
     fn rust_sources_use_crate_ident() {
         let files = render_files(&context(true));
-        assert!(file(&files, "sim/src/main.rs").contains("my_game::engine()"));
-        assert!(file(&files, "firmware/src/main.rs").contains("my_game::engine()"));
+        assert!(file(&files, "sim/src/main.rs").contains("my_game::MyGame::new"));
+        assert!(file(&files, "firmware/src/main.rs").contains("my_game::MyGame::new"));
+        assert!(file(&files, "game/src/lib.rs").contains("pub struct MyGame;"));
     }
 
     #[test]

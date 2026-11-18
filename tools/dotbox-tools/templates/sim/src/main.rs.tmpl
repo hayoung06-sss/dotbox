@@ -1,5 +1,6 @@
 //! PC 시뮬레이터로 {{name}}을 실행한다. `dotbox run`이 이 바이너리를 실행한다.
+//! 조작: 왼쪽 모듈 WASD + Space, 오른쪽 모듈 방향키 + Enter, F2 링크 끊기/잇기, Esc 종료.
 
-fn main() {
-    dotbox_sim::run({{crate}}::engine());
+fn main() -> dotbox_core::Result<()> {
+    dotbox_sim::run({{crate}}::{{type}}::new)
 }

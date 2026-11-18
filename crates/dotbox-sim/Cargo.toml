@@ -5,3 +5,4 @@ edition.workspace = true
 
 [dependencies]
 dotbox-core.workspace = true
+minifb = "0.29.0"

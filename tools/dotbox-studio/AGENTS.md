@@ -120,7 +120,9 @@ tools/
   - `ScreenLayout::Wide`(32×16, 기본)와 `ScreenLayout::Mirrored`(16×16 화면을 두 패널에 똑같이 표시).
   - `FrameBuffer`: `new(layout)`, `set_pixel(x, y, color)`(화면 밖 무시), `pixel(x, y)`, `fill`, `clear`,
     `copy_panel(Side::Left | Side::Right, &mut [Rgb; 256])`.
-- 아직 없는 것: 감마·밝기 처리, 글꼴, 스프라이트 타입, 사운드 데이터 형식, 에셋 변환.
+- 게임 API(`Game`, `GameState`, `Input`, `Note`/`Sound`, `testing::Harness`)는 `docs/game-api.md`에 있다.
+  효과음 편집기는 `dotbox_core::Note { freq_hz, duration_ms }` 목록을 만들면 된다.
+- 아직 없는 것: 감마·밝기 처리, 글꼴, 스프라이트 타입, 에셋 원본 형식, 에셋 변환.
 - `dotbox-tools`와 `dotbox-cli`는 1단계(`new`, `doctor`, `run`, `build`, `flash`, `monitor`, `studio`)가 구현되어 있다.
   Studio의 기기 패널은 `dotbox_tools::doctor::run`, `device::flash`, `device::detect_ports` 등을 직접 부른다.
   `dotbox studio`는 PATH에서 `dotbox-studio`를 찾아 프로젝트 디렉토리를 첫 인자로 넘겨 실행한다.

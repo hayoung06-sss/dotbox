@@ -4,7 +4,7 @@ ESP32 기반 도트매트릭스 휴대용 게임기 **DotBox**용 게임 엔진�
 
 이 저장소에는 엔진과 개발 도구(`dotbox` CLI)가 들어 있습니다. 게임은 별도 저장소에서 엔진을 의존성으로 가져다 씁니다.
 
-> 현재 엔진은 골격 단계입니다. 아래 API(`Engine`, `dotbox_sim::run`)는 바뀔 수 있고,
+> 현재 엔진은 초기 단계입니다. 아래 API(`Game`, `dotbox_sim::run`)는 바뀔 수 있고,
 > ESP32 실행기(`dotbox-esp`)는 아직 없습니다. 변경 내역은 [CHANGELOG.md](CHANGELOG.md)에 기록합니다.
 
 ## 사용 방법
@@ -27,7 +27,7 @@ crates/
                   # 화면 버퍼, 하드웨어 트레잇, 고정 틱, 모듈 역할 레코드
   dotbox-sim/     # PC 실행기. 창에 32×16 화면을 그리고 키보드를 입력으로 쓴다
 examples/
-  hello/          # 엔진 동작 확인용 최소 예제
+  hello/          # 엔진 동작 확인용 2인 예제. 두 플레이어가 각자 점을 움직인다
 platform/
   dotbox-esp/     # (예정) ESP32 실행기. esp 툴체인이 따로 필요해 workspace에서 뺀다
 tools/
@@ -44,7 +44,7 @@ docs/             # 명세 (CLI, 모듈 연결, 합체·분리 모드, 오류 �
 ```sh
 cargo build                       # 엔진, 도구, 예제 전체 빌드
 cargo test                        # 테스트 실행 (CLI 통합 테스트 포함)
-cargo run -p hello                # hello 예제를 PC 시뮬레이터로 실행
+cargo run -p hello                # hello 예제를 PC 시뮬레이터 창으로 실행
 cargo run -p dotbox-cli -- doctor # CLI를 설치하지 않고 실행
 ```
 
@@ -82,19 +82,20 @@ dotbox-core = { path = "../DotBoxEngine/crates/dotbox-core" }
 dotbox-sim  = { path = "../DotBoxEngine/crates/dotbox-sim" }
 ```
 
-게임 쪽이 `main`을 갖고, 실행할 플랫폼의 실행기를 호출합니다.
+게임은 `dotbox_core::Game` 트레잇을 구현합니다. 게임 쪽이 `main`을 갖고, 게임을 만드는 함수를 실행기에 넘깁니다.
 
 ```rust
-use dotbox_core::Engine;
-
-fn main() {
-    // PC에서 실행
-    dotbox_sim::run(Engine::new());
+fn main() -> dotbox_core::Result<()> {
+    // PC에서 실행. 게임이 여럿이면 || Games::new().with(Snake::new()).with(Pong::new())
+    dotbox_sim::run(MyGame::new)
 }
 ```
 
 실기기에서는 같은 게임 코드를 두고 `dotbox_sim::run` 대신 `dotbox_esp::run`을 호출합니다(예정).
-게임 로직은 `dotbox-core`의 트레잇만 사용하므로 플랫폼에 따라 고칠 필요가 없습니다.
+게임 API와 두 모듈의 동기화 방식은 [docs/game-api.md](docs/game-api.md)에 있고,
+[examples/hello](examples/hello/src/main.rs)가 가장 작은 예입니다.
+
+시뮬레이터 조작: 왼쪽 모듈(P1) WASD + Space, 오른쪽 모듈(P2) 방향키 + Enter, F2 링크 끊기/잇기, Esc 종료.
 
 ### 6. 예제 추가하기
 

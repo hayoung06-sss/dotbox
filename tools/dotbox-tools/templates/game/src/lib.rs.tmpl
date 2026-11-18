@@ -1,16 +1,90 @@
 //! {{name}} 게임 로직. 플랫폼(시뮬레이터, ESP32)을 모르고 dotbox-core에만 의존한다.
+//!
+//! 규칙: 화면에 필요한 모든 값은 `{{type}}State`에 둔다. 마스터(왼쪽 모듈)가 `update`로 상태를 바꾸고,
+//! 두 모듈이 같은 `render`로 그린다. 자세한 내용은 DotBox Engine의 docs/game-api.md.
 
-use dotbox_core::Engine;
+use dotbox_core as dbx;
 
-/// 이 게임을 담은 엔진을 만든다. 시뮬레이터(`sim`)와 펌웨어(`firmware`)가 함께 쓴다.
-pub fn engine() -> Engine {
-    Engine::new()
+/// 게임 객체. 마스터에서만 쓰는 값(화면과 무관한 것)을 둔다.
+#[derive(Debug, Default)]
+pub struct {{type}};
+
+impl {{type}} {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+/// 두 모듈이 화면을 그리는 데 필요한 상태. 매 틱 왼쪽 모듈이 오른쪽 모듈로 보낸다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct {{type}}State {
+    /// 플레이어별 점 위치 (x, y).
+    pub dots: [(u8, u8); 2],
+}
+
+impl dbx::GameState for {{type}}State {
+    const MAX_BYTES: usize = 4;
+
+    fn encode(&self, out: &mut dbx::StateWriter<'_>) -> dbx::Result<()> {
+        for (x, y) in self.dots {
+            out.u8(x)?;
+            out.u8(y)?;
+        }
+        Ok(())
+    }
+
+    fn decode(input: &mut dbx::StateReader<'_>) -> dbx::Result<Self> {
+        let mut dot = || -> dbx::Result<(u8, u8)> { Ok((input.u8()?, input.u8()?)) };
+        Ok(Self {
+            dots: [dot()?, dot()?],
+        })
+    }
+}
+
+impl dbx::Game for {{type}} {
+    type State = {{type}}State;
+
+    fn config(&self) -> dbx::GameConfig {
+        dbx::GameConfig::new("{{name}}")
+    }
+
+    fn init(&mut self, _ctx: &mut dbx::Context) -> {{type}}State {
+        {{type}}State {
+            dots: [(7, 7), (24, 7)],
+        }
+    }
+
+    fn update(&mut self, state: &mut {{type}}State, input: &dbx::Input, _ctx: &mut dbx::Context) {
+        for (dot, player) in state.dots.iter_mut().zip(input.players) {
+            if let Some(direction) = player.direction_pressed {
+                let (dx, dy) = direction.delta();
+                dot.0 = (i32::from(dot.0) + dx).clamp(0, 31) as u8;
+                dot.1 = (i32::from(dot.1) + dy).clamp(0, 15) as u8;
+            }
+        }
+    }
+
+    fn render(state: &{{type}}State, frame: &mut dbx::FrameBuffer) {
+        let colors = [dbx::Rgb::new(0, 255, 0), dbx::Rgb::new(0, 128, 255)];
+        for ((x, y), color) in state.dots.into_iter().zip(colors) {
+            frame.set_pixel(i32::from(x), i32::from(y), color);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use dbx::testing::Harness;
+
     #[test]
-    fn engine_can_be_created() {
-        let _engine = super::engine();
+    fn p1_moves_right() {
+        let mut harness = Harness::new({{type}}::new(), 1);
+        let mut input = dbx::Input::default();
+        input.players[0].direction = Some(dbx::Direction::Right);
+        input.players[0].direction_pressed = Some(dbx::Direction::Right);
+        harness.step(&input);
+        assert_eq!(harness.state().dots[0], (8, 7));
+        assert_eq!(harness.frame().pixel(8, 7), Some(dbx::Rgb::new(0, 255, 0)));
     }
 }

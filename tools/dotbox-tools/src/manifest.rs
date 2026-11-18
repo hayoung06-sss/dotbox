@@ -106,6 +106,20 @@ pub fn crate_ident(name: &str) -> String {
     name.replace('-', "_")
 }
 
+/// Rust 타입 이름(`my-game` → `MyGame`, `pong-2p` → `Pong2p`).
+pub fn type_ident(name: &str) -> String {
+    name.split('-')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect()
+}
+
 /// 찾아서 읽은 게임 프로젝트.
 #[derive(Debug, Clone)]
 pub struct Project {
@@ -208,6 +222,14 @@ mod tests {
             assert!(err.hint().is_some(), "{name}");
         }
         assert!(validate_name(&"a".repeat(NAME_MAX_CHARS + 1)).is_err());
+    }
+
+    #[test]
+    fn type_ident_is_upper_camel_case() {
+        assert_eq!(type_ident("my-game"), "MyGame");
+        assert_eq!(type_ident("snake"), "Snake");
+        assert_eq!(type_ident("pong-2p"), "Pong2p");
+        assert_eq!(type_ident("a1-b2"), "A1B2");
     }
 
     #[test]
