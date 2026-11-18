@@ -6,6 +6,57 @@ DotBox 게임 개발자를 위한 **데스크톱 개발 도구(GUI)**. 스프라
 저장소 루트의 `CLAUDE.md`(엔진 전체 규칙)도 함께 따른다. 이 파일은 Studio 작업에 필요한 내용을 추린 것이며,
 루트와 충돌하면 루트가 우선한다. 루트 CLAUDE.md를 자동으로 읽지 않는 AI 도구라면 먼저 그 파일을 읽는다.
 
+## AI 에이전트 주의 사항 (작업 전에 반드시 읽을 것)
+
+이 절은 Claude Code, Codex, Cursor, Copilot, Gemini 등 **어떤 AI 코딩 에이전트**에도 적용된다.
+사용자(Studio 담당 팀원)의 지시가 이 절과 충돌하면 진행하기 전에 사용자에게 확인한다.
+
+### 브랜치와 git
+
+- 작업 브랜치는 **`feat/studio`** 다. `main`에 직접 커밋하거나 push하지 않는다. main 반영은 PR로 하고 엔진 담당이 리뷰한다.
+- 작업을 시작할 때 `git fetch` 후 `git merge origin/main`으로 최신 엔진을 받는다. 공유 브랜치를 rebase하지 않는다.
+- 커밋과 push는 사용자가 요청할 때만 한다.
+- `git push --force`, `git reset --hard`, 브랜치 삭제, 기록 재작성은 사용자가 명시적으로 지시할 때만 한다.
+- 커밋하지 않는 것: `target/`, `.dotbox/`, 토큰·비밀번호, 개인 PC 경로가 들어간 설정 파일.
+
+### 수정 범위
+
+| 범위 | 경로 |
+|---|---|
+| 자유롭게 고친다 | `tools/dotbox-studio/` 전체 |
+| 한 줄만 고친다 | 루트 `Cargo.toml`의 `members`에 `"tools/dotbox-studio"` 추가, 루트 `CHANGELOG.md`의 `[Unreleased]`에 항목 추가 |
+| 사용자 확인 후 고친다 | `tools/dotbox-tools/`(CLI와 함께 쓰는 공유 라이브러리), `docs/`(명세) |
+| 고치지 않는다 | `crates/`(엔진), `tools/dotbox-cli/`, `examples/`, 루트 `CLAUDE.md` |
+
+- "고치지 않는다" 영역의 변경이 필요하면 직접 고치지 말고 이유와 변경안을 사용자에게 보고한다. 엔진 담당에게 요청할 내용이다.
+- 저장소 루트에 `AGENTS.md`를 만들지 않는다. 루트 지침은 `CLAUDE.md` 하나로 관리한다.
+- `Cargo.lock`은 손으로 고치지 않는다. cargo가 갱신한 변경은 커밋해도 된다.
+
+### 사실 확인
+
+- 엔진 API는 아직 바뀌는 중이다. 이 문서의 API 목록보다 **실제 코드**(`crates/dotbox-core/src/`, `tools/dotbox-tools/src/`)가 우선이다.
+  없는 함수나 타입을 있다고 가정하고 코드를 쓰지 않는다.
+- 외부 crate의 버전과 API는 기억에 의존하지 말고 `cargo add`와 실제 문서로 확인한다.
+- 하드웨어 사양(핀, 해상도, 밝기 제한)은 루트 `CLAUDE.md`의 하드웨어 절이 기준이다. 추측으로 정하지 않는다.
+
+### 커밋 전 확인
+
+```sh
+cargo fmt --all
+cargo clippy --workspace --all-targets   # 경고 0개
+cargo test                               # 저장소 전체(엔진, CLI 포함)가 통과해야 한다
+```
+
+- 기능을 추가하면 테스트를 함께 쓴다. GUI 코드와 로직(편집 명령, 실행 취소, 변환)을 나눠 로직을 GUI 없이 테스트한다.
+- 실패를 숨기지 않는다. 테스트를 지우거나 `#[ignore]`로 끄거나 `#[allow(...)]`로 경고를 덮어 통과시키지 않는다.
+- 끝나면 무엇을 바꿨는지, 무엇을 확인하지 못했는지 사용자에게 그대로 보고한다.
+
+### Windows 환경
+
+- 저장소 경로에 한글, 공백, OneDrive가 들어가면 펌웨어 빌드가 실패한다. Studio 자체는 상관없지만 경로를 옮기라고 안내한다.
+- Git이 `LF will be replaced by CRLF` 경고를 낼 수 있다. 무시해도 된다. 파일 전체의 줄 끝을 바꾸는 대량 변경은 하지 않는다.
+- 셸 명령은 PowerShell과 Git Bash 문법이 다르다. 명령을 쓰기 전에 어느 셸인지 확인한다.
+
 ## DotBox가 뭔가
 
 - ESP32 기반 휴대용 도트매트릭스 게임기. 같은 모듈 2개(왼쪽/오른쪽)가 붙어 있다.
@@ -18,8 +69,8 @@ DotBox 게임 개발자를 위한 **데스크톱 개발 도구(GUI)**. 스프라
 
 ```
 tools/
-  dotbox-tools/    # (예정) 라이브러리: 에셋 변환, 프로젝트 생성, doctor, 빌드·플래시
-  dotbox-cli/      # (예정) 바이너리 `dotbox`: dotbox-tools를 감싸는 CLI
+  dotbox-tools/    # 라이브러리: 프로젝트 생성, doctor, 빌드·플래시, (예정) 에셋 변환
+  dotbox-cli/      # 바이너리 `dotbox`: dotbox-tools를 감싸는 CLI
   dotbox-studio/   # ← 여기. egui 앱. 최종적으로 `dotbox studio`로 실행한다
 ```
 
@@ -79,8 +130,8 @@ tools/
 - **에셋 원본 형식과 생성 데이터 형식**(스프라이트, 글꼴, 멜로디)은 엔진 런타임과 맞물리므로 혼자 확정하지 않는다.
   제안서(간단한 Markdown이나 PR 설명)로 합의한 뒤 구현한다.
 - `crates/`(엔진) 코드는 엔진 담당 영역이다. Studio에 필요한 엔진 변경은 직접 크게 고치지 말고 요청하거나 작은 PR로 낸다.
-- 변환 로직이 필요한데 `dotbox-tools`가 아직 없으면 엔진 담당과 상의해 `tools/dotbox-tools`를 만든다.
-  임시로 Studio 안에 둘 때는 GUI 의존성 없는 별도 모듈로 분리해 나중에 그대로 옮길 수 있게 한다.
+- 에셋 변환 로직은 `tools/dotbox-tools`에 들어가야 한다. 엔진 담당과 상의하기 전에 임시로 Studio 안에 둘 때는
+  GUI 의존성 없는 별도 모듈로 분리해 나중에 그대로 옮길 수 있게 한다.
 
 ## 코드 규칙 (루트 CLAUDE.md 요약)
 
@@ -93,6 +144,7 @@ tools/
 
 ## 시작하기
 
+0. `git switch feat/studio`로 작업 브랜치에 있는지 확인한다.
 1. 이 디렉토리에 `Cargo.toml`(패키지 이름 `dotbox-studio`, `version.workspace = true`, `edition.workspace = true`,
    `publish = false`)과 `src/main.rs`를 만든다. 의존성: `dotbox-core.workspace = true`, `eframe`.
 2. 루트 `Cargo.toml`의 workspace `members`에 `"tools/dotbox-studio"`를 추가한다.

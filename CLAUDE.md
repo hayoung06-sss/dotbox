@@ -76,7 +76,7 @@ tools/                  # 호스트 개발 도구 (PC 전용)
   dotbox-tools/         # 라이브러리. 프로젝트 생성, doctor, 빌드·플래시, (예정) 에셋 변환. 게임 build.rs도 쓴다
     templates/          # `dotbox new`가 쓰는 게임 프로젝트 템플릿(*.tmpl, include_str!로 포함)
   dotbox-cli/           # 바이너리 `dotbox`. dotbox-tools를 감싸는 얇은 CLI
-  dotbox-studio/        # (예정) egui 개발 도구 GUI. 다른 팀원 담당. 자체 AGENTS.md가 있다
+  dotbox-studio/        # (예정) egui 개발 도구 GUI. 다른 팀원 담당, 작업 브랜치 feat/studio. 자체 AGENTS.md가 있다
 ```
 
 - 도구는 CLI를 먼저 만들고 GUI는 그 위에 얹는다. GUI에서 하는 모든 작업에는 같은 일을 하는 CLI 명령이 있다.
