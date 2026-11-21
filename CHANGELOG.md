@@ -43,3 +43,4 @@
     `dotbox-esp`가 아직 없어 실기기 경로는 검증 전이다
   - `dotbox studio`: PATH의 `dotbox-studio` 실행
   - `dotbox-studio`: egui 기반 GUI 에디터 기본 뼈대 및 워크스페이스 패키지 추가 (신X우 올림)
+  - `dotbox-studio`: 32×16·16×16 도트 캔버스 편집기, 팔레트, 패널 경계선 및 실기기 밝기 미리보기 추가 (신x우 올림)
