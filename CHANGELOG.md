@@ -42,3 +42,4 @@
   - `dotbox build`, `dotbox flash --side left|right|both`, `dotbox monitor`: 펌웨어 빌드, 굽기와 역할 기록, 시리얼 모니터.
     `dotbox-esp`가 아직 없어 실기기 경로는 검증 전이다
   - `dotbox studio`: PATH의 `dotbox-studio` 실행
+  - `dotbox-studio`: egui 기반 GUI 에디터 기본 뼈대 및 워크스페이스 패키지 추가 (신X우 올림)
