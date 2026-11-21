@@ -81,19 +81,29 @@ pub fn build_run_args() -> Vec<String> {
     vec!["run".to_string()]
 }
 
-// `dotbox flash` 명령 인자 목록 생성 (단일 대상일 때만 --port 반영)
-pub fn build_flash_args(target: FlashTarget, port: Option<&str>) -> Vec<String> {
-    let mut args = vec!["flash".to_string(), target.as_cli_arg().to_string()];
-
-    // 양쪽 동시(Both)가 아니고 포트 문자열이 비어 있지 않을 때만 --port 추가
-    if target != FlashTarget::Both
-        && let Some(port_name) = port
-    {
-        let trimmed = port_name.trim();
+// `dotbox flash` 명령 인자 목록 생성 (`docs/cli.md`의 flash 명세를 따른다)
+// - 한쪽만 구울 때: `flash --side left -p COM3`
+// - 양쪽을 구울 때: `flash --side both --left-port COM3 --right-port COM4`
+// 포트 문자열이 비어 있으면 해당 옵션을 빼고 CLI의 자동 포트 결정에 맡긴다.
+pub fn build_flash_args(target: FlashTarget, port: &str, right_port: &str) -> Vec<String> {
+    let mut args = vec![
+        "flash".to_string(),
+        "--side".to_string(),
+        target.as_cli_arg().to_string(),
+    ];
+    let mut push_port = |option: &str, value: &str| {
+        let trimmed = value.trim();
         if !trimmed.is_empty() {
-            args.push("--port".to_string());
+            args.push(option.to_string());
             args.push(trimmed.to_string());
         }
+    };
+
+    if target == FlashTarget::Both {
+        push_port("--left-port", port);
+        push_port("--right-port", right_port);
+    } else {
+        push_port("--port", port);
     }
 
     args
@@ -173,24 +183,41 @@ mod tests {
         assert_eq!(build_doctor_args(), vec!["doctor"]);
     }
 
-    // 단일 모듈 플래시 시 --port 옵션이 포함되는지 검증
+    // 단일 모듈 플래시 시 --side와 --port 옵션이 포함되는지 검증
     #[test]
     fn flash_single_side_includes_port() {
-        let args = build_flash_args(FlashTarget::Left, Some("COM3"));
-        assert_eq!(args, vec!["flash", "left", "--port", "COM3"]);
+        let args = build_flash_args(FlashTarget::Left, "COM3", "COM9");
+        assert_eq!(args, vec!["flash", "--side", "left", "--port", "COM3"]);
     }
 
-    // 양쪽 동시 플래시 시 단일 --port 옵션이 제외되는지 검증
+    // 양쪽 동시 플래시 시 모듈별 포트 옵션을 쓰는지 검증
     #[test]
-    fn flash_both_omits_single_port() {
-        let args = build_flash_args(FlashTarget::Both, Some("COM3"));
-        assert_eq!(args, vec!["flash", "both"]);
+    fn flash_both_uses_per_side_ports() {
+        let args = build_flash_args(FlashTarget::Both, "COM3", "COM4");
+        assert_eq!(
+            args,
+            vec![
+                "flash",
+                "--side",
+                "both",
+                "--left-port",
+                "COM3",
+                "--right-port",
+                "COM4"
+            ]
+        );
     }
 
-    // 빈 포트 문자열은 --port 인자를 추가하지 않는지 검증
+    // 빈 포트 문자열은 포트 인자를 추가하지 않는지 검증 (자동 결정)
     #[test]
     fn flash_ignores_blank_port() {
-        let args = build_flash_args(FlashTarget::Right, Some("   "));
-        assert_eq!(args, vec!["flash", "right"]);
+        assert_eq!(
+            build_flash_args(FlashTarget::Right, "   ", ""),
+            vec!["flash", "--side", "right"]
+        );
+        assert_eq!(
+            build_flash_args(FlashTarget::Both, "", " COM4 "),
+            vec!["flash", "--side", "both", "--right-port", "COM4"]
+        );
     }
 }

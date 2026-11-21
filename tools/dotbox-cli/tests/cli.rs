@@ -85,6 +85,18 @@ fn project_commands_fail_outside_project() {
         &["build"][..],
         &["monitor"][..],
         &["flash", "--side", "left"][..],
+        // DotBox Studio 기기 패널이 만드는 인자 형식(tools/dotbox-studio/src/device.rs).
+        // 사용법 오류(2)가 아니라 프로젝트 없음(1)으로 끝나야 한다.
+        &["flash", "--side", "right", "--port", "COM3"][..],
+        &[
+            "flash",
+            "--side",
+            "both",
+            "--left-port",
+            "COM3",
+            "--right-port",
+            "COM4",
+        ][..],
     ] {
         let output = dotbox()
             .current_dir(dir.path())

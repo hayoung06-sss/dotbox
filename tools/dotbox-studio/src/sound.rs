@@ -1,3 +1,5 @@
+// 음표 타입은 엔진과 같은 것을 쓴다 (주파수 0Hz = 쉼표)
+pub use dotbox_core::Note;
 use rodio::{OutputStream, Sink, Source};
 use std::time::Duration;
 
@@ -18,23 +20,6 @@ pub const NOTE_PRESETS: [(&str, u16); 9] = [
     ("시(B5)", 988),
     ("높은도(C6)", 1047),
 ];
-
-// 단음 부저 음표 1개 (주파수 0Hz = 쉼표)
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Note {
-    pub freq_hz: u16,     // 주파수 (Hz), 0이면 무음(쉼표)
-    pub duration_ms: u16, // 재생 길이 (ms)
-}
-
-impl Note {
-    // 새 음표 생성
-    pub fn new(freq_hz: u16, duration_ms: u16) -> Self {
-        Self {
-            freq_hz,
-            duration_ms,
-        }
-    }
-}
 
 // 효과음·멜로디 시퀀스를 관리하는 편집기 상태
 #[derive(Clone, Debug)]

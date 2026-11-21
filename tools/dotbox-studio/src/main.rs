@@ -76,7 +76,8 @@ struct DeviceTabState {
     ports: Vec<DetectedPort>,             // 마지막으로 스캔한 시리얼 포트 목록
     port_status: String,                  // 포트 스캔 상태 메시지
     selected_target: FlashTarget,         // 플래시 대상 (좌측 / 우측 / 양쪽)
-    selected_port: String,                // 플래시 시 지정할 시리얼 포트 (비우면 자동)
+    selected_port: String,                // 플래시 포트. 양쪽이면 왼쪽 포트 (비우면 자동)
+    selected_right_port: String,          // 양쪽 플래시 시 오른쪽 포트 (비우면 자동)
     pending_rx: Option<Receiver<String>>, // 백그라운드 명령 결과 수신기
     output_log: String,                   // CLI 실행 로그 출력 내용
 }
@@ -95,6 +96,7 @@ impl Default for DeviceTabState {
             port_status: "[포트 새로고침]을 눌러 연결된 기기를 확인하세요.".to_string(),
             selected_target: FlashTarget::Left,
             selected_port: String::new(),
+            selected_right_port: String::new(),
             pending_rx: None,
             output_log: "실행 로그가 여기에 표시됩니다.".to_string(),
         }
@@ -547,13 +549,23 @@ impl StudioApp {
         });
 
         ui.horizontal(|ui| {
-            ui.label("지정 포트 (비우면 자동):");
-            // 양쪽 동시 플래시 시에는 단일 포트 입력 비활성화
-            let port_enabled = self.device_tab.selected_target != FlashTarget::Both;
-            ui.add_enabled(
-                port_enabled,
+            // 양쪽 동시 플래시면 모듈별 포트를 따로 받는다
+            let both = self.device_tab.selected_target == FlashTarget::Both;
+            ui.label(if both {
+                "왼쪽 포트 (비우면 자동):"
+            } else {
+                "지정 포트 (비우면 자동):"
+            });
+            ui.add(
                 egui::TextEdit::singleline(&mut self.device_tab.selected_port).desired_width(120.0),
             );
+            if both {
+                ui.label("오른쪽 포트:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.device_tab.selected_right_port)
+                        .desired_width(120.0),
+                );
+            }
 
             // `dotbox flash` 실행 버튼
             if ui
@@ -562,7 +574,8 @@ impl StudioApp {
             {
                 let args = build_flash_args(
                     self.device_tab.selected_target,
-                    Some(&self.device_tab.selected_port),
+                    &self.device_tab.selected_port,
+                    &self.device_tab.selected_right_port,
                 );
                 self.launch_cli_command(args);
             }
