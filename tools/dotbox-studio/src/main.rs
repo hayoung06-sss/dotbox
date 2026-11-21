@@ -1,11 +1,13 @@
 mod editor; // 1순위: 스프라이트·화면 편집 로직 모듈
 mod font; // 2순위: 글꼴 변환·미리보기 로직 모듈
+mod sound; // 3순위: 효과음·멜로디 편집 및 재생 로직 모듈
 
 use dotbox_core::display::{FrameBuffer, PANEL_WIDTH, ScreenLayout};
 use dotbox_core::hal::Rgb;
 use editor::{CanvasEditor, PALETTE, scale_brightness};
 use eframe::egui;
 use font::{FontConfig, FontConverter};
+use sound::{MelodyEditor, NOTE_PRESETS, play_melody_async};
 use std::path::Path;
 
 // 캔버스 한 칸(도트 1개)의 화면 픽셀 크기
@@ -16,7 +18,8 @@ const CELL_SIZE: f32 = 24.0;
 enum ActiveTab {
     #[default]
     SpriteEditor, // 1번 탭: 스프라이트·화면 편집기
-    FontTool, // 2번 탭: 글꼴 변환과 미리보기
+    FontTool,  // 2번 탭: 글꼴 변환과 미리보기
+    SoundTool, // 3번 탭: 효과음·멜로디 편집기
 }
 
 // 글꼴 탭 전용 UI 상태
@@ -41,12 +44,31 @@ impl Default for FontTabState {
     }
 }
 
+// 효과음·멜로디 탭 전용 UI 상태
+struct SoundTabState {
+    melody: MelodyEditor, // 음표 시퀀스 편집기
+    new_freq_hz: u16,     // 새로 추가할 음표의 주파수 (Hz)
+    new_duration_ms: u16, // 새로 추가할 음표의 길이 (ms)
+}
+
+impl Default for SoundTabState {
+    // 기본 음표 입력값(도 523Hz, 150ms)으로 초기화
+    fn default() -> Self {
+        Self {
+            melody: MelodyEditor::default(),
+            new_freq_hz: 523,
+            new_duration_ms: 150,
+        }
+    }
+}
+
 // GUI 앱 전체 상태 (Default 자동 구현)
 #[derive(Default)]
 struct StudioApp {
-    active_tab: ActiveTab,  // 현재 열려 있는 탭
-    editor: CanvasEditor,   // 1순위: 도트 캔버스 편집기 상태
-    font_tab: FontTabState, // 2순위: 글꼴 변환기 상태
+    active_tab: ActiveTab,    // 현재 열려 있는 탭
+    editor: CanvasEditor,     // 1순위: 도트 캔버스 편집기 상태
+    font_tab: FontTabState,   // 2순위: 글꼴 변환기 상태
+    sound_tab: SoundTabState, // 3순위: 효과음·멜로디 편집기 상태
 }
 
 impl StudioApp {
@@ -278,6 +300,107 @@ impl StudioApp {
             );
         }
     }
+
+    // 3순위: 효과음·멜로디 편집기 탭 화면
+    fn show_sound_tab(&mut self, ui: &mut egui::Ui) {
+        // 1) 상단 재생·초기화 버튼 및 전체 길이 요약
+        ui.horizontal(|ui| {
+            // 현재 시퀀스 전체를 PC 스피커로 비동기 재생
+            if ui.button("▶ 전체 재생").clicked() {
+                play_melody_async(self.sound_tab.melody.notes().to_vec());
+            }
+            // 모든 음표 삭제
+            if ui.button("전체 지우기").clicked() {
+                self.sound_tab.melody.clear();
+            }
+            ui.separator();
+            // 현재 음표 개수와 총 재생 시간(ms) 표시
+            ui.label(format!(
+                "음표: {}개 | 총 길이: {} ms",
+                self.sound_tab.melody.notes().len(),
+                self.sound_tab.melody.total_duration_ms()
+            ));
+        });
+        ui.add_space(6.0);
+
+        // 2) 빠른 음계 프리셋 버튼 (클릭 즉시 현재 길이로 시퀀스 끝에 추가)
+        ui.horizontal(|ui| {
+            ui.label("빠른 추가:");
+            for (name, freq_hz) in NOTE_PRESETS {
+                if ui.button(name).clicked() {
+                    self.sound_tab
+                        .melody
+                        .add_note(freq_hz, self.sound_tab.new_duration_ms);
+                }
+            }
+        });
+
+        // 3) 사용자가 원하는 주파수(Hz)·길이(ms)를 직접 입력해 추가
+        ui.horizontal(|ui| {
+            ui.label("주파수(Hz, 0=쉼표):");
+            ui.add(egui::DragValue::new(&mut self.sound_tab.new_freq_hz).range(0..=4000));
+            ui.label("길이(ms):");
+            ui.add(egui::DragValue::new(&mut self.sound_tab.new_duration_ms).range(20..=2000));
+            if ui.button("+ 음표 추가").clicked() {
+                self.sound_tab
+                    .melody
+                    .add_note(self.sound_tab.new_freq_hz, self.sound_tab.new_duration_ms);
+            }
+        });
+        ui.separator();
+
+        // 4) 순회 중 벡터 수정 충돌을 피하기 위해 이동·삭제할 인덱스만 임시 기록
+        let mut remove_idx = None;
+        let mut move_up_idx = None;
+        let mut move_down_idx = None;
+
+        // 음표 시퀀스 목록 (세로 스크롤 지원)
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            let len = self.sound_tab.melody.notes().len(); // 전체 음표 수
+            for (idx, note) in self.sound_tab.melody.notes_mut().iter_mut().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(format!("#{:02}", idx + 1)); // 음표 순서 번호
+                    ui.label("Hz:");
+                    // 개별 음표 주파수 수정
+                    ui.add(egui::DragValue::new(&mut note.freq_hz).range(0..=4000));
+                    ui.label("ms:");
+                    // 개별 음표 길이 수정
+                    ui.add(egui::DragValue::new(&mut note.duration_ms).range(20..=2000));
+
+                    // 이 음표 1개만 스피커로 미리 듣기
+                    if ui.button("▶").clicked() {
+                        play_melody_async(vec![*note]);
+                    }
+                    // 위로 이동 버튼 (첫 번째 항목은 비활성화)
+                    if ui.add_enabled(idx > 0, egui::Button::new("▲")).clicked() {
+                        move_up_idx = Some(idx);
+                    }
+                    // 아래로 이동 버튼 (마지막 항목은 비활성화)
+                    if ui
+                        .add_enabled(idx + 1 < len, egui::Button::new("▼"))
+                        .clicked()
+                    {
+                        move_down_idx = Some(idx);
+                    }
+                    // 개별 음표 삭제 버튼
+                    if ui.button("삭제").clicked() {
+                        remove_idx = Some(idx);
+                    }
+                });
+            }
+        });
+
+        // 루프 종료 후 기록해 둔 이동·삭제 작업 실제 반영
+        if let Some(idx) = move_up_idx {
+            self.sound_tab.melody.move_up(idx);
+        }
+        if let Some(idx) = move_down_idx {
+            self.sound_tab.melody.move_down(idx);
+        }
+        if let Some(idx) = remove_idx {
+            self.sound_tab.melody.remove_note(idx);
+        }
+    }
 }
 
 // 읽기 전용 FrameBuffer를 32×16 도트 매트릭스로 화면에 그리는 헬퍼 함수
@@ -365,6 +488,11 @@ impl eframe::App for StudioApp {
                     ActiveTab::FontTool,
                     "2. 글꼴 변환·미리보기",
                 );
+                ui.selectable_value(
+                    &mut self.active_tab,
+                    ActiveTab::SoundTool,
+                    "3. 효과음·멜로디 편집기",
+                );
             });
             ui.separator();
             ui.add_space(6.0);
@@ -384,6 +512,9 @@ impl eframe::App for StudioApp {
                 }
                 ActiveTab::FontTool => {
                     self.show_font_tab(ui); // 글꼴 변환 및 미리보기 화면
+                }
+                ActiveTab::SoundTool => {
+                    self.show_sound_tab(ui); // 효과음·멜로디 편집 화면
                 }
             }
         });

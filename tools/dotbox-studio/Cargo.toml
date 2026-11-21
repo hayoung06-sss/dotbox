@@ -8,3 +8,4 @@ publish = false
 dotbox-core.workspace = true
 eframe = "0.37.0"
 fontdue = "0.9.5"
+rodio = "0.19"
