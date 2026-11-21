@@ -43,6 +43,7 @@
     `dotbox-esp`가 아직 없어 실기기 경로는 검증 전이다
   - `dotbox studio`: PATH의 `dotbox-studio` 실행
   - `dotbox-studio`: egui 기반 GUI 에디터 기본 뼈대 및 워크스페이스 패키지 추가 (신X우 올림)
-  - `dotbox-studio`: 32×16·16×16 도트 캔버스 편집기, 팔레트, 패널 경계선 및 실기기 밝기 미리보기 추가 (신x우 올림)
-  - `dotbox-studio`: TTF/OTF 1비트 글꼴 변환기 및 32×16 실기기 미리보기 탭 추가 (신x우 올림)
-  - `dotbox-studio`: 단음 부저(Hz/ms) 효과음·멜로디 편집기 및 PC 스피커 구형파 재생 탭 추가 (신x우 올림)
+  - `dotbox-studio`: 32×16·16×16 도트 캔버스 편집기, 팔레트, 패널 경계선 및 실기기 밝기 미리보기 추가 (신X우 올림)
+  - `dotbox-studio`: TTF/OTF 1비트 글꼴 변환기 및 32×16 실기기 미리보기 탭 추가 (신X우 올림)
+  - `dotbox-studio`: 단음 부저(Hz/ms) 효과음·멜로디 편집기 및 PC 스피커 구형파 재생 탭 추가 (신X우 올림)
+  - `dotbox-studio`: 시리얼 포트 감지, `dotbox doctor`/`run` 실행, 좌·우·양쪽 모듈 플래시를 지원하는 기기 패널 탭 추가 (신X우 올림)

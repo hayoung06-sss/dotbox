@@ -1,14 +1,20 @@
+mod device; // 4순위: 환경 점검·포트 감지·플래시 로직 모듈
 mod editor; // 1순위: 스프라이트·화면 편집 로직 모듈
 mod font; // 2순위: 글꼴 변환·미리보기 로직 모듈
 mod sound; // 3순위: 효과음·멜로디 편집 및 재생 로직 모듈
 
+use device::{
+    DetectedPort, FlashTarget, build_doctor_args, build_flash_args, build_run_args,
+    run_command_async, scan_serial_ports,
+};
 use dotbox_core::display::{FrameBuffer, PANEL_WIDTH, ScreenLayout};
 use dotbox_core::hal::Rgb;
 use editor::{CanvasEditor, PALETTE, scale_brightness};
 use eframe::egui;
 use font::{FontConfig, FontConverter};
 use sound::{MelodyEditor, NOTE_PRESETS, play_melody_async};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, TryRecvError};
 
 // 캔버스 한 칸(도트 1개)의 화면 픽셀 크기
 const CELL_SIZE: f32 = 24.0;
@@ -18,8 +24,9 @@ const CELL_SIZE: f32 = 24.0;
 enum ActiveTab {
     #[default]
     SpriteEditor, // 1번 탭: 스프라이트·화면 편집기
-    FontTool,  // 2번 탭: 글꼴 변환과 미리보기
-    SoundTool, // 3번 탭: 효과음·멜로디 편집기
+    FontTool,    // 2번 탭: 글꼴 변환과 미리보기
+    SoundTool,   // 3번 탭: 효과음·멜로디 편집기
+    DevicePanel, // 4번 탭: 기기 패널 (doctor · 포트 · 플래시)
 }
 
 // 글꼴 탭 전용 UI 상태
@@ -62,13 +69,46 @@ impl Default for SoundTabState {
     }
 }
 
+// 기기 패널 탭 전용 UI 상태
+struct DeviceTabState {
+    dotbox_bin: String,                   // 실행할 dotbox CLI 경로 또는 명령 이름
+    project_dir: String,                  // 명령을 실행할 DotBox 게임 프로젝트 경로
+    ports: Vec<DetectedPort>,             // 마지막으로 스캔한 시리얼 포트 목록
+    port_status: String,                  // 포트 스캔 상태 메시지
+    selected_target: FlashTarget,         // 플래시 대상 (좌측 / 우측 / 양쪽)
+    selected_port: String,                // 플래시 시 지정할 시리얼 포트 (비우면 자동)
+    pending_rx: Option<Receiver<String>>, // 백그라운드 명령 결과 수신기
+    output_log: String,                   // CLI 실행 로그 출력 내용
+}
+
+impl Default for DeviceTabState {
+    // 현재 작업 디렉터리를 기본 프로젝트 경로로 설정
+    fn default() -> Self {
+        let cwd = std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| ".".to_string());
+
+        Self {
+            dotbox_bin: "dotbox".to_string(),
+            project_dir: cwd,
+            ports: Vec::new(),
+            port_status: "[포트 새로고침]을 눌러 연결된 기기를 확인하세요.".to_string(),
+            selected_target: FlashTarget::Left,
+            selected_port: String::new(),
+            pending_rx: None,
+            output_log: "실행 로그가 여기에 표시됩니다.".to_string(),
+        }
+    }
+}
+
 // GUI 앱 전체 상태 (Default 자동 구현)
 #[derive(Default)]
 struct StudioApp {
-    active_tab: ActiveTab,    // 현재 열려 있는 탭
-    editor: CanvasEditor,     // 1순위: 도트 캔버스 편집기 상태
-    font_tab: FontTabState,   // 2순위: 글꼴 변환기 상태
-    sound_tab: SoundTabState, // 3순위: 효과음·멜로디 편집기 상태
+    active_tab: ActiveTab,      // 현재 열려 있는 탭
+    editor: CanvasEditor,       // 1순위: 도트 캔버스 편집기 상태
+    font_tab: FontTabState,     // 2순위: 글꼴 변환기 상태
+    sound_tab: SoundTabState,   // 3순위: 효과음·멜로디 편집기 상태
+    device_tab: DeviceTabState, // 4순위: 기기 패널 상태
 }
 
 impl StudioApp {
@@ -401,6 +441,153 @@ impl StudioApp {
             self.sound_tab.melody.remove_note(idx);
         }
     }
+
+    // 4순위: 기기 패널 탭 화면 (환경 점검 · 포트 감지 · 플래시)
+    fn show_device_tab(&mut self, ui: &mut egui::Ui) {
+        // 백그라운드에서 실행 중인 CLI 명령 결과가 도착했는지 매 프레임 확인
+        if let Some(rx) = &self.device_tab.pending_rx {
+            match rx.try_recv() {
+                Ok(log) => {
+                    // 실행 완료: 로그를 갱신하고 수신기 정리
+                    self.device_tab.output_log = log;
+                    self.device_tab.pending_rx = None;
+                }
+                Err(TryRecvError::Empty) => {
+                    // 아직 실행 중이면 결과가 바로 반영되도록 다음 프레임 갱신 요청
+                    ui.ctx().request_repaint();
+                }
+                Err(TryRecvError::Disconnected) => {
+                    // 채널이 예기치 않게 끊어진 경우 정리
+                    self.device_tab.pending_rx = None;
+                }
+            }
+        }
+
+        let is_busy = self.device_tab.pending_rx.is_some(); // 현재 명령 실행 중 여부
+
+        // 1) 프로젝트 경로 및 dotbox CLI 실행 경로 설정
+        ui.horizontal(|ui| {
+            ui.label("프로젝트 경로:");
+            ui.text_edit_singleline(&mut self.device_tab.project_dir);
+            ui.separator();
+            ui.label("CLI 명령:");
+            ui.text_edit_singleline(&mut self.device_tab.dotbox_bin);
+        });
+        ui.add_space(6.0);
+
+        // 2) 환경 점검(doctor) 및 시뮬레이터 실행(run) 버튼
+        ui.horizontal(|ui| {
+            // `dotbox doctor` 실행 버튼
+            if ui
+                .add_enabled(!is_busy, egui::Button::new("환경 점검 (dotbox doctor)"))
+                .clicked()
+            {
+                self.launch_cli_command(build_doctor_args());
+            }
+            // `dotbox run` 실행 버튼
+            if ui
+                .add_enabled(!is_busy, egui::Button::new("시뮬레이터 실행 (dotbox run)"))
+                .clicked()
+            {
+                self.launch_cli_command(build_run_args());
+            }
+            // 명령 실행 중일 때 진행 상태 안내
+            if is_busy {
+                ui.label("명령 실행 중...");
+            }
+        });
+        ui.separator();
+
+        // 3) 시리얼 포트 감지 및 목록 표시
+        ui.horizontal(|ui| {
+            if ui.button("시리얼 포트 새로고침").clicked() {
+                match scan_serial_ports() {
+                    Ok(ports) => {
+                        self.device_tab.port_status = format!("감지된 포트: {}개", ports.len());
+                        self.device_tab.ports = ports;
+                    }
+                    Err(err) => {
+                        self.device_tab.ports.clear();
+                        self.device_tab.port_status = err;
+                    }
+                }
+            }
+            ui.label(&self.device_tab.port_status);
+        });
+
+        // 감지된 포트를 클릭하면 아래 플래시 포트 입력칸에 자동 입력
+        for port in &self.device_tab.ports {
+            ui.horizontal(|ui| {
+                if ui.button(&port.name).clicked() {
+                    self.device_tab.selected_port = port.name.clone();
+                }
+                ui.label(&port.description);
+            });
+        }
+        ui.separator();
+
+        // 4) 좌/우/양쪽 모듈 플래시 대상 선택 및 실행 버튼
+        ui.horizontal(|ui| {
+            ui.label("플래시 대상:");
+            ui.selectable_value(
+                &mut self.device_tab.selected_target,
+                FlashTarget::Left,
+                "왼쪽 모듈 (left)",
+            );
+            ui.selectable_value(
+                &mut self.device_tab.selected_target,
+                FlashTarget::Right,
+                "오른쪽 모듈 (right)",
+            );
+            ui.selectable_value(
+                &mut self.device_tab.selected_target,
+                FlashTarget::Both,
+                "양쪽 모두 (both)",
+            );
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("지정 포트 (비우면 자동):");
+            // 양쪽 동시 플래시 시에는 단일 포트 입력 비활성화
+            let port_enabled = self.device_tab.selected_target != FlashTarget::Both;
+            ui.add_enabled(
+                port_enabled,
+                egui::TextEdit::singleline(&mut self.device_tab.selected_port).desired_width(120.0),
+            );
+
+            // `dotbox flash` 실행 버튼
+            if ui
+                .add_enabled(!is_busy, egui::Button::new("펌웨어 플래시 실행"))
+                .clicked()
+            {
+                let args = build_flash_args(
+                    self.device_tab.selected_target,
+                    Some(&self.device_tab.selected_port),
+                );
+                self.launch_cli_command(args);
+            }
+        });
+        ui.separator();
+
+        // 5) CLI 실행 결과 로그 영역 (세로 스크롤 + 고정폭 글꼴)
+        ui.label("실행 로그:");
+        egui::ScrollArea::vertical()
+            .max_height(240.0)
+            .show(ui, |ui| {
+                ui.monospace(&self.device_tab.output_log);
+            });
+    }
+
+    // 기기 패널에서 CLI 명령을 백그라운드로 시작하는 공통 헬퍼
+    fn launch_cli_command(&mut self, args: Vec<String>) {
+        self.device_tab.output_log = "명령을 실행하는 중입니다...".to_string();
+        let rx = run_command_async(
+            self.device_tab.dotbox_bin.clone(),
+            args,
+            PathBuf::from(&self.device_tab.project_dir),
+        );
+        self.device_tab.pending_rx = Some(rx); // 결과 수신 채널 저장
+    }
 }
 
 // 읽기 전용 FrameBuffer를 32×16 도트 매트릭스로 화면에 그리는 헬퍼 함수
@@ -493,6 +680,7 @@ impl eframe::App for StudioApp {
                     ActiveTab::SoundTool,
                     "3. 효과음·멜로디 편집기",
                 );
+                ui.selectable_value(&mut self.active_tab, ActiveTab::DevicePanel, "4. 기기 패널");
             });
             ui.separator();
             ui.add_space(6.0);
@@ -516,6 +704,9 @@ impl eframe::App for StudioApp {
                 ActiveTab::SoundTool => {
                     self.show_sound_tab(ui); // 효과음·멜로디 편집 화면
                 }
+                ActiveTab::DevicePanel => {
+                    self.show_device_tab(ui); // 기기 패널 화면
+                }
             }
         });
     }
@@ -523,9 +714,9 @@ impl eframe::App for StudioApp {
 
 // 프로그램 시작점
 fn main() -> eframe::Result {
-    // 창 초기 크기 설정 (860×600)
+    // 창 초기 크기 설정 (880×620)
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([860.0, 600.0]),
+        viewport: egui::ViewportBuilder::default().with_inner_size([880.0, 620.0]),
         ..Default::default()
     };
 
