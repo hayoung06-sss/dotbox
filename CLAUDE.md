@@ -67,7 +67,7 @@ ESP32 기반 도트매트릭스 휴대용 게임기 **DotBox**용 통합 게임 
 
 ```
 Cargo.toml              # 호스트용 가상 workspace (members = crates/*, examples/*, tools/의 crate; dotbox-esp 제외)
-docs/                   # 명세: game-api.md, cli.md, pairing.md, modes.md, errors.md
+docs/                   # 명세: game-api.md, cli.md, pairing.md, modes.md, errors.md, studio.md(제안)
 crates/
   dotbox-core/          # 하드웨어 독립 엔진. std만 쓰고 ESP 의존성은 없다. PC에서 테스트한다
   dotbox-sim/           # 라이브러리. PC 실행기: 마스터·슬레이브 엔진 두 개를 한 창에. 키보드 입력

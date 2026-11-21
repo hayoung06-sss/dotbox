@@ -296,7 +296,7 @@ DotBox Studio를 실행한다. `DIR`을 생략하면 현재 프로젝트(없으�
 | `dotbox assets build --out <DIR>` | 변환 결과(생성된 Rust 소스)를 `<DIR>`에 쓴다 |
 | `dotbox font convert` / `preview` | 글꼴 변환과 미리보기. 스네이크·핑퐁에 필요한 범위(숫자 글꼴)를 먼저 확인한 뒤 범위를 정한다 |
 
-평소 빌드에서는 `game/build.rs`가 `dotbox-tools`를 불러 `OUT_DIR`에 생성한다. 원본·생성 형식은 에셋 형식 문서(미작성)에서 Studio 담당과 정한다.
+평소 빌드에서는 `game/build.rs`가 `dotbox-tools`를 불러 `OUT_DIR`에 생성한다. 원본·생성 형식은 `docs/studio.md` 5장(제안)에서 Studio 담당과 정한다.
 
 ## 7. `dotbox-tools` 대응표
 
@@ -315,4 +315,4 @@ DotBox Studio를 실행한다. `DIR`을 생략하면 현재 프로젝트(없으�
 - 경로 길이 기준값(80자, 24자). ESP-IDF 빌드로 실측해 정한다.
 - 플래시 용량과 파티션 크기. 보드(CMODULE-43) 확정 후 확인한다.
 - 펌웨어 템플릿(`build.rs`, `.cargo/config.toml`, `sdkconfig.defaults`)의 실제 빌드 검증. `dotbox-esp`와 함께 한다.
-- 에셋 원본·생성 형식. 별도 문서에서 Studio 담당과 합의한다.
+- 에셋 원본·생성 형식. `docs/studio.md` 5장의 제안을 Studio 담당과 합의한다.
