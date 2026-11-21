@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*", "examples/*", "tools/dotbox-tools", "tools/dotbox-cli"]
+members = ["crates/*", "examples/*", "tools/dotbox-tools", "tools/dotbox-cli", "tools/dotbox-studio"]
 exclude = ["platform/dotbox-esp"]
 
 [workspace.package]
