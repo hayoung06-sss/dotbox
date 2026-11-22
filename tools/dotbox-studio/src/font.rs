@@ -30,6 +30,7 @@ pub struct BitmapGlyph {
     pub width: usize,     // 비트맵 가로 크기(px)
     pub height: usize,    // 비트맵 세로 크기(px)
     pub advance_x: usize, // 다음 글자까지 이동할 가로 간격(px)
+    pub y_offset: i32,    // 기준선(baseline)으로부터의 Y 오프셋 (위로 갈수록 양수)
     pub bits: Vec<bool>,  // 1비트 픽셀 배열 (길이 = width * height)
 }
 
@@ -86,6 +87,7 @@ impl FontConverter {
             width: metrics.width,
             height: metrics.height,
             advance_x,
+            y_offset: metrics.ymin,
             bits,
         }
     }
@@ -101,19 +103,23 @@ impl FontConverter {
             .collect()
     }
 
-    // 미리보기 문자열을 엔진 FrameBuffer(32×16)에 직접 렌더링
+    // 미리보기 문자열을 엔진 FrameBuffer(32×16)에 기준선 또는 중앙 정렬로 렌더링
     pub fn render_preview(
         &self,
         text: &str,
         pixel_size: f32,
         threshold: u8,
         color: Rgb,
+        align_baseline: bool,
     ) -> FrameBuffer {
         // 32×16 엔진 프레임버퍼 생성
         let mut fb = FrameBuffer::new(ScreenLayout::Wide);
         let max_w = usize::from(fb.width()); // 화면 가로(32)
         let max_h = usize::from(fb.height()); // 화면 세로(16)
         let mut cursor_x: usize = 0; // 현재 글자를 찍을 X 시작 위치
+
+        // 16px 높이 화면에서 기준선(baseline)을 y=12(하단 4px 여백)로 배치
+        let baseline_y: i32 = (max_h as i32 * 3) / 4;
 
         // 문자열의 각 글자를 왼쪽부터 순서대로 그리기
         for ch in text.chars() {
@@ -124,18 +130,25 @@ impl FontConverter {
 
             // 현재 문자를 1비트 비트맵으로 변환
             let glyph = self.rasterize_char(ch, pixel_size, threshold);
-            // 글자를 세로(16px) 중앙에 맞춰 배치할 Y 오프셋 계산
-            let offset_y = max_h.saturating_sub(glyph.height) / 2;
+            let offset_y = if align_baseline {
+                // 기준선 정렬: 글자 상단 Y = baseline_y - (ymin + height)
+                baseline_y - (glyph.y_offset + glyph.height as i32)
+            } else {
+                // 단순 세로 중앙 정렬
+                (max_h.saturating_sub(glyph.height) / 2) as i32
+            };
 
             // 글리프의 모든 픽셀을 순회하며 켜진 점만 프레임버퍼에 찍기
             for y in 0..glyph.height {
                 for x in 0..glyph.width {
                     if glyph.pixel(x, y) {
                         let px = cursor_x + x; // 실제 화면 X 좌표
-                        let py = offset_y + y; // 실제 화면 Y 좌표
-                        // 안전한 i32 변환 후 엔진 프레임버퍼에 픽셀 설정
-                        if let (Ok(ix), Ok(iy)) = (i32::try_from(px), i32::try_from(py)) {
-                            fb.set_pixel(ix, iy, color);
+                        let py = offset_y + y as i32; // 실제 화면 Y 좌표
+                        if let Ok(ix) = i32::try_from(px)
+                            && py >= 0
+                            && py < max_h as i32
+                        {
+                            fb.set_pixel(ix, py, color);
                         }
                     }
                 }
@@ -198,6 +211,7 @@ mod tests {
             width: 2,
             height: 2,
             advance_x: 2,
+            y_offset: 0,
             bits: vec![true, false, false, true],
         };
         assert!(glyph.pixel(0, 0)); // 켜진 픽셀 확인

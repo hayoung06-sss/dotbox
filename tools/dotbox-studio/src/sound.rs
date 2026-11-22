@@ -8,6 +8,16 @@ const SAMPLE_RATE: u32 = 44_100;
 // 귀가 아프지 않도록 구형파 기본 볼륨 제한 (15%)
 const BUZZER_VOLUME: f32 = 0.15;
 
+// 일반적인 수동 부저(PWM) 가청·정상 발음 주파수 범위 (Hz)
+// 0Hz는 쉼표로 허용되며, 1~30Hz 또는 4000Hz 초과는 왜곡·무음 경고 대상
+pub const BUZZER_MIN_FREQ_HZ: u16 = 31;
+pub const BUZZER_MAX_FREQ_HZ: u16 = 4000;
+
+// 주파수가 부저 발음 가능 범위 안인지 검사 (0Hz 쉼표는 정상)
+pub fn is_valid_buzzer_freq(freq_hz: u16) -> bool {
+    freq_hz == 0 || (BUZZER_MIN_FREQ_HZ..=BUZZER_MAX_FREQ_HZ).contains(&freq_hz)
+}
+
 // 자주 쓰는 기본 음계 프리셋 (이름, 주파수 Hz)
 pub const NOTE_PRESETS: [(&str, u16); 9] = [
     ("쉼표", 0),
@@ -235,5 +245,14 @@ mod tests {
         let samples: Vec<f32> = SquareWave::new(0, 10).collect(); // 10ms 쉼표 샘플 생성
         assert_eq!(samples.len(), 441); // 44,100Hz * 0.01s = 441개
         assert!(samples.iter().all(|&s| s == 0.0)); // 모든 샘플이 0.0인지 확인
+    }
+
+    // 부저 주파수 범위 검사(쉼표·정상·범위 밖) 검증
+    #[test]
+    fn buzzer_freq_range_validation() {
+        assert!(is_valid_buzzer_freq(0));
+        assert!(is_valid_buzzer_freq(440));
+        assert!(!is_valid_buzzer_freq(20));
+        assert!(!is_valid_buzzer_freq(4500));
     }
 }

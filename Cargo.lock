@@ -1096,6 +1096,7 @@ dependencies = [
  "png 0.17.16",
  "rodio",
  "serde",
+ "serde_json",
  "serialport",
  "tempfile",
  "toml",

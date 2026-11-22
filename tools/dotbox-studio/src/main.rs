@@ -1,8 +1,10 @@
 mod asset_io; // 스프라이트(.png) · 효과음(.sound.toml) · 글꼴(.font.toml) · 아이콘 파일 입출력 모듈
 mod command; // GUI 독립 편집 명령 객체 및 실행 취소/다시 실행 모듈
-mod device; // 4순위: 환경 점검·포트 감지·플래시 로직 모듈
+mod device;
+mod diagnostics; // cargo JSON 컴파일 진단 파싱 모듈 // 4순위: 환경 점검·포트 감지·플래시 로직 모듈
 mod editor; // 1순위: 스프라이트·화면 편집 로직 모듈
 mod font; // 2순위: 글꼴 변환·미리보기 로직 모듈
+mod serial_log; // 왼쪽/오른쪽 모듈 시리얼 로그 수신·검색·저장 모듈
 mod settings; // 사용자 전역 설정 (최근 프로젝트, 창 크기, 밝기)
 mod sound; // 3순위: 효과음·멜로디 편집 및 재생 로직 모듈
 mod tabs; // 파일 단위 탭 및 더티(●) 상태 관리 모듈
@@ -19,14 +21,19 @@ use device::{
     DetectedPort, FlashTarget, RunningCommand, build_flash_args, build_run_args, format_command,
     scan_serial_ports, spawn_command_streaming,
 };
+use diagnostics::{CargoDiagnostic, DiagnosticLevel, parse_cargo_json_line};
 use dotbox_core::display::{FrameBuffer, PANEL_WIDTH, ScreenLayout};
 use dotbox_core::hal::Rgb;
 use dotbox_tools::doctor::{Level, Report};
 use editor::{CanvasEditor, DrawTool, PALETTE, SpriteSnapshot, scale_brightness};
 use eframe::egui;
 use font::{FontConfig, FontConverter};
+use serial_log::SerialMonitor;
 use settings::UserSettings;
-use sound::{MelodyEditor, NOTE_PRESETS, play_melody_async};
+use sound::{
+    BUZZER_MAX_FREQ_HZ, BUZZER_MIN_FREQ_HZ, MelodyEditor, NOTE_PRESETS, is_valid_buzzer_freq,
+    play_melody_async,
+};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use tabs::{TabKind, TabManager};
@@ -40,7 +47,17 @@ const CELL_SIZE: f32 = 24.0;
 enum BottomTab {
     #[default]
     Output, // CLI 실행 출력 로그
-    Problems, // doctor 점검 오류·경고 문제 목록
+    Problems, // doctor 점검 및 cargo 빌드 문제 목록
+    Serial,   // 왼쪽·오른쪽 모듈 시리얼 로그 뷰어
+}
+
+// 시리얼 로그 뷰어 배치 방식 (나란히 / 왼쪽만 / 오른쪽만)
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum SerialViewMode {
+    #[default]
+    Split, // 왼쪽·오른쪽 나란히 표시
+    Left,  // 왼쪽 모듈만 크게 표시
+    Right, // 오른쪽 모듈만 크게 표시
 }
 
 // 저장하지 않은 변경 사항이 있을 때 사용자 확인을 기다리는 대기 동작
@@ -85,6 +102,7 @@ struct FontTabState {
     config: FontConfig,               // 픽셀 크기, 임계값, 문자 집합 설정
     license: String,                  // 글꼴 라이선스 정보
     preview_text: String,             // 32×16 화면에 미리 볼 문구
+    align_baseline: bool,             // true면 기준선(baseline) 정렬, false면 세로 중앙 정렬
     converter: Option<FontConverter>, // 불러온 폰트 변환기 (불러오기 전엔 None)
     status_message: String,           // 폰트 불러오기 안내 메시지
     asset_name: String,               // 저장·불러올 글꼴 이름 (fonts/<이름>.font.toml)
@@ -98,6 +116,7 @@ impl Default for FontTabState {
             config: FontConfig::default(),
             license: String::new(),
             preview_text: "DotBox".to_string(),
+            align_baseline: true,
             converter: None,
             status_message: "TTF/OTF 경로를 입력하고 [폰트 불러오기]를 누르세요.".to_string(),
             asset_name: "main".to_string(),
@@ -193,31 +212,37 @@ struct StudioApp {
     opened: Option<OpenedProject>,  // 현재 열린 프로젝트 (없으면 시작 화면 표시)
     start_screen: StartScreenState, // 시작 화면 UI 상태
     settings_form: ProjectSettingsForm, // 프로젝트 설정 탭 입력 폼 상태
-    doctor_report: Option<Report>,  // 마지막 doctor::run 점검 결과
-    doctor_rx: Option<Receiver<Report>>, // 백그라운드 doctor 실행 수신기
-    doctor_host_only: bool,         // 시뮬레이터 전용 점검 옵션 여부
-    tabs: TabManager,               // 파일 단위 중앙 탭 관리자
+    doctor_report: Option<Report>,
+    build_diagnostics: Vec<CargoDiagnostic>, // cargo 컴파일 에러/경고 목록  // 마지막 doctor::run 점검 결과
+    doctor_rx: Option<Receiver<Report>>,     // 백그라운드 doctor 실행 수신기
+    doctor_host_only: bool,                  // 시뮬레이터 전용 점검 옵션 여부
+    tabs: TabManager,                        // 파일 단위 중앙 탭 관리자
     pending_confirm: Option<PendingConfirm>, // 미저장 탭/프로젝트/앱 닫기 확인 팝업 상태
-    allow_app_close: bool,          // 확인 팝업에서 앱 종료를 승인했는지 여부
-    bottom_tab: BottomTab,          // 현재 열려 있는 하단 패널 탭
-    show_bottom_panel: bool,        // 하단 패널 펼침 여부
-    editor: CanvasEditor,           // 스프라이트·화면 편집기 상태
+    allow_app_close: bool,                   // 확인 팝업에서 앱 종료를 승인했는지 여부
+    bottom_tab: BottomTab,                   // 현재 열려 있는 하단 패널 탭
+    show_bottom_panel: bool,                 // 하단 패널 펼침 여부
+    serial_left: SerialMonitor,              // 왼쪽 모듈 시리얼 모니터
+    serial_right: SerialMonitor,             // 오른쪽 모듈 시리얼 모니터
+    serial_view_mode: SerialViewMode,        // 시리얼 로그 배치 방식
+    serial_search: String,                   // 시리얼 로그 검색어
+    serial_save_status: String,              // 시리얼 로그 파일 저장 결과 안내
+    editor: CanvasEditor,                    // 스프라이트·화면 편집기 상태
     canvas_history: CommandHistory<CanvasEditor>, // 스프라이트 탭 독립 Undo/Redo 이력
     canvas_drag_before: Option<SpriteSnapshot>, // 마우스 드래그 시작 시점의 스프라이트 스냅샷
-    draw_tool: DrawTool,            // 현재 선택된 스프라이트 그리기 도구
-    shape_start: Option<(usize, usize)>, // 직선·사각형 드래그 시작 좌표
-    anim_playing: bool,             // 애니메이션 재생 미리보기 실행 여부
-    anim_elapsed_ms: f32,           // 현재 프레임 경과 시간 (ms)
-    font_tab: FontTabState,         // 글꼴 변환기 상태
-    sound_tab: SoundTabState,       // 효과음·멜로디 편집기 상태 (Undo/Redo 포함)
-    device_tab: DeviceTabState,     // 기기 패널 상태
-    sprite_asset_name: String,      // 저장·불러올 스프라이트 이름 (sprites/<이름>.png)
-    sprite_io_status: String,       // 저장/불러오기 결과 안내
-    sprite_files: Vec<String>,      // 탐색기에 표시할 assets/sprites/*.png 목록
-    sound_files: Vec<String>,       // 탐색기에 표시할 assets/sounds/*.sound.toml 목록
-    font_files: Vec<String>,        // 탐색기에 표시할 assets/fonts/*.font.toml 목록
-    has_icon: bool,                 // assets/icon.png 파일 존재 여부
-    editing_icon: bool,             // true면 스프라이트 편집기가 assets/icon.png(16×16) 편집 모드
+    draw_tool: DrawTool,                     // 현재 선택된 스프라이트 그리기 도구
+    shape_start: Option<(usize, usize)>,     // 직선·사각형 드래그 시작 좌표
+    anim_playing: bool,                      // 애니메이션 재생 미리보기 실행 여부
+    anim_elapsed_ms: f32,                    // 현재 프레임 경과 시간 (ms)
+    font_tab: FontTabState,                  // 글꼴 변환기 상태
+    sound_tab: SoundTabState,                // 효과음·멜로디 편집기 상태 (Undo/Redo 포함)
+    device_tab: DeviceTabState,              // 기기 패널 상태
+    sprite_asset_name: String,               // 저장·불러올 스프라이트 이름 (sprites/<이름>.png)
+    sprite_io_status: String,                // 저장/불러오기 결과 안내
+    sprite_files: Vec<String>,               // 탐색기에 표시할 assets/sprites/*.png 목록
+    sound_files: Vec<String>,                // 탐색기에 표시할 assets/sounds/*.sound.toml 목록
+    font_files: Vec<String>,                 // 탐색기에 표시할 assets/fonts/*.font.toml 목록
+    has_icon: bool,                          // assets/icon.png 파일 존재 여부
+    editing_icon: bool, // true면 스프라이트 편집기가 assets/icon.png(16×16) 편집 모드
 }
 
 impl StudioApp {
@@ -234,6 +259,7 @@ impl StudioApp {
             start_screen: StartScreenState::default(),
             settings_form: ProjectSettingsForm::default(),
             doctor_report: None,
+            build_diagnostics: Vec::new(),
             doctor_rx: None,
             doctor_host_only: false,
             tabs: TabManager::new(), // [개요] 탭 기본 열림
@@ -241,6 +267,11 @@ impl StudioApp {
             allow_app_close: false, // 기본값: 미저장 탭이 있으면 종료 차단
             bottom_tab: BottomTab::Output,
             show_bottom_panel: true, // 하단 패널 기본 표시
+            serial_left: SerialMonitor::new(),
+            serial_right: SerialMonitor::new(),
+            serial_view_mode: SerialViewMode::Split,
+            serial_search: String::new(),
+            serial_save_status: String::new(),
             editor,
             canvas_history: CommandHistory::new(), // 깨끗한 이력으로 초기화
             canvas_drag_before: None,              // 드래그 중 아님
@@ -277,9 +308,14 @@ impl StudioApp {
                 if let Some(mut cmd) = self.device_tab.running_cmd.take() {
                     cmd.stop();
                 }
-                // 기기 패널의 기본 왼쪽 포트 동기화
-                self.device_tab.selected_port =
+                // 기기 패널 및 시리얼 모니터 포트 동기화 (기존 연결은 해제)
+                self.serial_left.disconnect();
+                self.serial_right.disconnect();
+                self.serial_left.port_name =
                     opened.local_config.ports.left.clone().unwrap_or_default();
+                self.serial_right.port_name =
+                    opened.local_config.ports.right.clone().unwrap_or_default();
+                self.device_tab.selected_port = self.serial_left.port_name.clone();
                 // 프로젝트 설정 폼 동기화
                 self.settings_form.sync_from(&opened);
                 // 최근 프로젝트 목록 맨 앞에 추가 후 사용자 설정 저장
@@ -294,6 +330,8 @@ impl StudioApp {
                 self.canvas_drag_before = None;
                 self.shape_start = None;
                 self.editing_icon = false;
+                self.anim_playing = false;
+                self.anim_elapsed_ms = 0.0;
                 self.pending_confirm = None;
                 self.start_screen.error_message = None;
                 // 프로젝트 열기 직후 환경 점검(doctor)을 백그라운드로 자동 시작
@@ -318,12 +356,15 @@ impl StudioApp {
 
     // 확인 없이 즉시 프로젝트를 닫고 시작 화면으로 복귀
     fn force_close_project(&mut self) {
-        // 프로젝트 닫기 시 실행 중인 시뮬레이터·빌드 프로세스 정리
+        // 프로젝트 닫기 시 실행 중인 시뮬레이터·빌드 프로세스 및 시리얼 연결 정리
         if let Some(mut cmd) = self.device_tab.running_cmd.take() {
             cmd.stop();
         }
+        self.serial_left.disconnect();
+        self.serial_right.disconnect();
         self.opened = None; // 열린 프로젝트 비우기
         self.doctor_report = None; // doctor 결과 정리
+        self.build_diagnostics.clear();
         self.doctor_rx = None; // doctor 수신기 정리
         self.tabs = TabManager::new(); // 탭 목록 초기화
         self.sound_tab.history.reset(); // 효과음 편집 이력 초기화
@@ -331,6 +372,8 @@ impl StudioApp {
         self.canvas_drag_before = None;
         self.shape_start = None;
         self.editing_icon = false;
+        self.anim_playing = false;
+        self.anim_elapsed_ms = 0.0;
         self.sprite_files.clear();
         self.sound_files.clear();
         self.font_files.clear();
@@ -378,6 +421,8 @@ impl StudioApp {
         // 확인 팝업에서 이미 종료를 승인한 경우 CLI 정리·창 크기 저장 후 종료 진행
         if self.allow_app_close {
             self.stop_cli_command();
+            self.serial_left.disconnect();
+            self.serial_right.disconnect();
             self.save_window_size(ctx);
             return;
         }
@@ -390,6 +435,8 @@ impl StudioApp {
             self.pending_confirm = Some(PendingConfirm::App); // 종료 확인 팝업 표시
         } else {
             self.stop_cli_command(); // 실행 중인 자식 프로세스 정리
+            self.serial_left.disconnect();
+            self.serial_right.disconnect();
             self.save_window_size(ctx); // 미저장 변경이 없으면 창 크기 저장 후 바로 종료
         }
     }
@@ -471,6 +518,8 @@ impl StudioApp {
             self.canvas_history.reset();
             self.canvas_drag_before = None;
             self.shape_start = None;
+            self.anim_playing = false;
+            self.anim_elapsed_ms = 0.0;
             self.sprite_io_status =
                 "새 icon.png (16×16) 편집 중 — Ctrl+S로 저장하세요.".to_string();
         }
@@ -706,8 +755,11 @@ impl StudioApp {
 
         // 2) 실행 중인 CLI 프로세스의 줄 단위 출력 수신 및 종료 확인
         if let Some(cmd) = &mut self.device_tab.running_cmd {
-            // 새로 도착한 출력 줄을 즉시 로그 끝에 추가
+            // 새로 도착한 출력 줄을 즉시 로그 끝에 추가 및 cargo JSON 진단 파싱
             for line in cmd.poll_lines() {
+                if let Some(diag) = parse_cargo_json_line(&line) {
+                    self.build_diagnostics.push(diag);
+                }
                 self.device_tab.output_log.push_str(&line);
                 self.device_tab.output_log.push('\n');
             }
@@ -716,6 +768,9 @@ impl StudioApp {
             if let Some(status_line) = cmd.try_finish() {
                 // 종료 직전 파이프에 남은 마지막 줄까지 모두 비우기
                 for line in cmd.poll_lines() {
+                    if let Some(diag) = parse_cargo_json_line(&line) {
+                        self.build_diagnostics.push(diag);
+                    }
                     self.device_tab.output_log.push_str(&line);
                     self.device_tab.output_log.push('\n');
                 }
@@ -725,6 +780,13 @@ impl StudioApp {
             } else {
                 ctx.request_repaint(); // 실행 중이면 계속 실시간 갱신 요청
             }
+        }
+
+        // 3) 왼쪽·오른쪽 시리얼 모니터 수신 폴링
+        let left_active = self.serial_left.poll();
+        let right_active = self.serial_right.poll();
+        if left_active || right_active {
+            ctx.request_repaint(); // 시리얼 연결 중이면 실시간 로그 표시 갱신
         }
     }
 
@@ -1313,12 +1375,18 @@ impl StudioApp {
 
     // 하단 패널 렌더링 ([출력] · [문제 N])
     fn show_bottom_panel(&mut self, ui: &mut egui::Ui) {
-        // doctor 점검 결과에서 경고·오류 항목 개수 계산
-        let problem_count = self
+        // doctor 점검 및 cargo 컴파일 결과에서 경고·오류 항목 개수 계산
+        let doctor_problem_count = self
             .doctor_report
             .as_ref()
             .map(|r| r.count(Level::Error) + r.count(Level::Warn))
             .unwrap_or(0);
+        let cargo_problem_count = self
+            .build_diagnostics
+            .iter()
+            .filter(|d| matches!(d.level, DiagnosticLevel::Error | DiagnosticLevel::Warning))
+            .count();
+        let problem_count = doctor_problem_count + cargo_problem_count;
 
         // 하단 탭 헤더 바
         ui.horizontal(|ui| {
@@ -1328,56 +1396,183 @@ impl StudioApp {
                 BottomTab::Problems,
                 format!("문제 ({problem_count})"),
             );
+            ui.selectable_value(
+                &mut self.bottom_tab,
+                BottomTab::Serial,
+                "시리얼: 왼쪽 | 오른쪽",
+            );
         });
         ui.separator();
+
+        // 시리얼 탭은 자체 상단 툴바와 좌/우 분할 스크롤 영역을 사용
+        if self.bottom_tab == BottomTab::Serial {
+            self.show_serial_tab(ui);
+            return;
+        }
 
         // 선택된 하단 탭 내용 표시
         egui::ScrollArea::vertical()
             .max_height(130.0)
             .show(ui, |ui| match self.bottom_tab {
+                BottomTab::Serial => {}
                 BottomTab::Output => {
                     ui.monospace(&self.device_tab.output_log); // CLI 실행 로그 출력
                 }
                 BottomTab::Problems => {
-                    let Some(report) = &self.doctor_report else {
-                        ui.label("환경 점검 결과가 아직 없습니다.");
-                        return;
-                    };
-
-                    // 오류·경고 항목만 필터링해 목록으로 표시
+                    let mut total_problems = 0;
                     let mut jump_to_overview = false;
-                    let mut count = 0;
-                    for check in &report.checks {
-                        if check.level == Level::Error || check.level == Level::Warn {
-                            count += 1;
-                            let color = level_color(check.level);
-                            let line = format!(
-                                "[{}] {} — {}",
-                                check.level.as_str().to_uppercase(),
-                                check.id,
-                                check.message
-                            );
-                            // 항목 클릭 시 개요 탭으로 이동해 상세 힌트 확인 가능
-                            if ui
-                                .add(
-                                    egui::Label::new(egui::RichText::new(line).color(color))
-                                        .sense(egui::Sense::click()),
-                                )
-                                .clicked()
-                            {
-                                jump_to_overview = true;
+
+                    // 1) cargo 빌드/실행 컴파일 에러 및 경고 (종류 · 위치 · 메시지)
+                    if !self.build_diagnostics.is_empty() {
+                        ui.strong("빌드 / 컴파일 진단");
+                        for diag in &self.build_diagnostics {
+                            total_problems += 1;
+                            let color = match diag.level {
+                                DiagnosticLevel::Error => egui::Color32::from_rgb(240, 100, 100),
+                                DiagnosticLevel::Warning => egui::Color32::from_rgb(240, 200, 80),
+                                DiagnosticLevel::Note => egui::Color32::from_rgb(160, 200, 240),
+                                DiagnosticLevel::Help => egui::Color32::from_rgb(120, 220, 140),
+                            };
+
+                            let loc = match (&diag.file, diag.line, diag.column) {
+                                (Some(f), Some(l), Some(c)) => format!("{f}:{l}:{c}"),
+                                (Some(f), Some(l), None) => format!("{f}:{l}"),
+                                (Some(f), None, None) => f.clone(),
+                                _ => "위치 미상".to_string(),
+                            };
+
+                            let line_text =
+                                format!("[{}] {} — {}", diag.level.as_str(), loc, diag.message);
+                            ui.label(egui::RichText::new(line_text).color(color));
+                        }
+                        ui.separator();
+                    }
+
+                    // 2) doctor 환경 점검 오류 및 경고
+                    if let Some(report) = &self.doctor_report {
+                        ui.strong("환경 점검 (doctor)");
+                        let mut doc_count = 0;
+                        for check in &report.checks {
+                            if check.level == Level::Error || check.level == Level::Warn {
+                                total_problems += 1;
+                                doc_count += 1;
+                                let color = level_color(check.level);
+                                let line = format!(
+                                    "[{}] {} — {}",
+                                    check.level.as_str().to_uppercase(),
+                                    check.id,
+                                    check.message
+                                );
+                                if ui
+                                    .add(
+                                        egui::Label::new(egui::RichText::new(line).color(color))
+                                            .sense(egui::Sense::click()),
+                                    )
+                                    .on_hover_text("클릭 시 개요 탭으로 이동")
+                                    .clicked()
+                                {
+                                    jump_to_overview = true;
+                                }
                             }
+                        }
+                        if doc_count == 0 {
+                            ui.colored_label(
+                                egui::Color32::from_gray(140),
+                                "  (환경 점검 문제 없음)",
+                            );
                         }
                     }
 
-                    if count == 0 {
+                    if total_problems == 0 {
                         ui.label("발견된 문제가 없습니다.");
                     }
                     if jump_to_overview {
-                        self.tabs.open(TabKind::Overview); // 개요 탭 열기
+                        self.tabs.open(TabKind::Overview);
                     }
                 }
             });
+    }
+
+    // 하단 시리얼 로그 뷰어 탭 렌더링 (왼쪽·오른쪽 나란히/단독 보기 · 검색 · 일시정지 · 저장)
+    fn show_serial_tab(&mut self, ui: &mut egui::Ui) {
+        let project_root = self.opened.as_ref().map(|o| o.project.root().to_path_buf());
+
+        // 상단 공통 바: 보기 방식 전환 · 검색어 입력 · 저장 결과 안내
+        ui.horizontal(|ui| {
+            ui.label("보기:");
+            ui.selectable_value(&mut self.serial_view_mode, SerialViewMode::Split, "나란히");
+            ui.selectable_value(&mut self.serial_view_mode, SerialViewMode::Left, "왼쪽만");
+            ui.selectable_value(
+                &mut self.serial_view_mode,
+                SerialViewMode::Right,
+                "오른쪽만",
+            );
+            ui.separator();
+            ui.label("검색:");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.serial_search)
+                    .hint_text("필터 키워드...")
+                    .desired_width(150.0),
+            );
+            if !self.serial_search.is_empty() && ui.small_button("×").clicked() {
+                self.serial_search.clear();
+            }
+            if !self.serial_save_status.is_empty() {
+                ui.separator();
+                ui.label(&self.serial_save_status);
+            }
+        });
+        ui.add_space(4.0);
+
+        let search = self.serial_search.clone();
+        let save_status = &mut self.serial_save_status;
+
+        match self.serial_view_mode {
+            SerialViewMode::Split => {
+                ui.columns(2, |cols| {
+                    show_serial_pane(
+                        &mut cols[0],
+                        "왼쪽 모듈",
+                        "serial_left",
+                        &mut self.serial_left,
+                        &search,
+                        project_root.as_deref(),
+                        save_status,
+                    );
+                    show_serial_pane(
+                        &mut cols[1],
+                        "오른쪽 모듈",
+                        "serial_right",
+                        &mut self.serial_right,
+                        &search,
+                        project_root.as_deref(),
+                        save_status,
+                    );
+                });
+            }
+            SerialViewMode::Left => {
+                show_serial_pane(
+                    ui,
+                    "왼쪽 모듈",
+                    "serial_left",
+                    &mut self.serial_left,
+                    &search,
+                    project_root.as_deref(),
+                    save_status,
+                );
+            }
+            SerialViewMode::Right => {
+                show_serial_pane(
+                    ui,
+                    "오른쪽 모듈",
+                    "serial_right",
+                    &mut self.serial_right,
+                    &search,
+                    project_root.as_deref(),
+                    save_status,
+                );
+            }
+        }
     }
 
     // 개요 탭 화면 (명세서 4.2)
@@ -1653,9 +1848,17 @@ impl StudioApp {
                         &self.settings_form.right_port,
                     ) {
                         Ok(()) => {
-                            // 기기 패널의 기본 포트에도 즉시 반영
+                            // 기기 패널 및 시리얼 모니터 포트에도 즉시 반영
                             self.device_tab.selected_port =
                                 opened.local_config.ports.left.clone().unwrap_or_default();
+                            if !self.serial_left.is_connected() {
+                                self.serial_left.port_name =
+                                    opened.local_config.ports.left.clone().unwrap_or_default();
+                            }
+                            if !self.serial_right.is_connected() {
+                                self.serial_right.port_name =
+                                    opened.local_config.ports.right.clone().unwrap_or_default();
+                            }
                             self.settings_form.status_message =
                                 ".dotbox/local.toml 포트 설정을 저장했습니다.".to_string();
                             self.settings_form.error_message.clear();
@@ -2118,7 +2321,7 @@ impl StudioApp {
         });
     }
 
-    // 글꼴 변환과 미리보기 탭 화면
+    // 글꼴 변환과 미리보기 탭 화면 (기준선 정렬 + 글자별 결과 표 포함)
     fn show_font_tab(&mut self, ui: &mut egui::Ui) {
         // 1) 글꼴 설정 파일 저장·불러오기 바 (assets/fonts/<이름>.font.toml)
         ui.horizontal(|ui| {
@@ -2193,10 +2396,14 @@ impl StudioApp {
 
         if let Some(converter) = &self.font_tab.converter {
             let glyphs = converter.rasterize_charset(&self.font_tab.config);
-            ui.label(format!(
-                "변환된 고유 글자 수: {}자 (1비트 비트맵)",
-                glyphs.len()
-            ));
+            ui.horizontal(|ui| {
+                ui.label(format!(
+                    "변환된 고유 글자 수: {}자 (1비트 비트맵)",
+                    glyphs.len()
+                ));
+                ui.separator();
+                ui.checkbox(&mut self.font_tab.align_baseline, "기준선(baseline) 정렬");
+            });
             ui.add_space(4.0);
 
             // 글꼴 미리보기 색상은 흰색 고정 (스프라이트 브러시 색과 상태 분리)
@@ -2205,6 +2412,7 @@ impl StudioApp {
                 self.font_tab.config.pixel_size,
                 self.font_tab.config.threshold,
                 Rgb::WHITE,
+                self.font_tab.align_baseline,
             );
             // 전역 밝기 설정(self.settings)을 직접 참조해 스프라이트 편집기와 상태 완전 분리
             draw_framebuffer_preview(
@@ -2213,6 +2421,74 @@ impl StudioApp {
                 self.settings.led_preview,
                 self.settings.brightness_percent,
             );
+            ui.add_space(8.0);
+
+            // 글자별 변환 결과 표 (문자 · 크기 · 자간 · 기준선 오프셋 · 1비트 미니 미리보기)
+            egui::CollapsingHeader::new("글자별 결과 표")
+                .default_open(true)
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .max_height(200.0)
+                        .show(ui, |ui| {
+                            egui::Grid::new("font_glyph_table")
+                                .striped(true)
+                                .spacing([14.0, 4.0])
+                                .show(ui, |ui| {
+                                    ui.strong("문자");
+                                    ui.strong("크기 (W×H)");
+                                    ui.strong("간격 (adv)");
+                                    ui.strong("기준선 Y");
+                                    ui.strong("비트맵");
+                                    ui.end_row();
+
+                                    for g in &glyphs {
+                                        let ch_label = if g.ch == ' ' {
+                                            "(공백)".to_string()
+                                        } else {
+                                            format!("'{}'", g.ch)
+                                        };
+                                        ui.monospace(ch_label);
+                                        ui.label(format!("{}×{}", g.width, g.height));
+                                        ui.label(format!("{}px", g.advance_x));
+                                        ui.label(format!("{:+}", g.y_offset));
+
+                                        // 1비트 미니 글리프 미리보기 (도트 1개 = 2×2px)
+                                        let dot = 2.0;
+                                        let preview_w = (g.width.max(1) as f32) * dot;
+                                        let preview_h = (g.height.max(1) as f32) * dot;
+                                        let (rect, _) = ui.allocate_exact_size(
+                                            egui::vec2(preview_w, preview_h),
+                                            egui::Sense::hover(),
+                                        );
+                                        let painter = ui.painter();
+                                        painter.rect_filled(
+                                            rect,
+                                            egui::CornerRadius::ZERO,
+                                            egui::Color32::BLACK,
+                                        );
+                                        for y in 0..g.height {
+                                            for x in 0..g.width {
+                                                if g.pixel(x, y) {
+                                                    let px_rect = egui::Rect::from_min_size(
+                                                        egui::pos2(
+                                                            rect.min.x + x as f32 * dot,
+                                                            rect.min.y + y as f32 * dot,
+                                                        ),
+                                                        egui::vec2(dot, dot),
+                                                    );
+                                                    painter.rect_filled(
+                                                        px_rect,
+                                                        egui::CornerRadius::ZERO,
+                                                        egui::Color32::WHITE,
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                });
         }
     }
 
@@ -2290,10 +2566,16 @@ impl StudioApp {
             }
         });
 
-        // 3) 직접 주파수·길이 입력 후 추가 (명령 객체로 기록)
+        // 3) 직접 주파수·길이 입력 후 추가 (명령 객체로 기록 + 부저 범위 밖 경고)
         ui.horizontal(|ui| {
             ui.label("주파수(Hz, 0=쉼표):");
-            ui.add(egui::DragValue::new(&mut self.sound_tab.new_freq_hz).range(0..=4000));
+            ui.add(egui::DragValue::new(&mut self.sound_tab.new_freq_hz).range(0..=6000));
+            if !is_valid_buzzer_freq(self.sound_tab.new_freq_hz) {
+                ui.colored_label(
+                    egui::Color32::from_rgb(240, 200, 80),
+                    format!("⚠ 부저 권장 범위({BUZZER_MIN_FREQ_HZ}~{BUZZER_MAX_FREQ_HZ}Hz) 밖"),
+                );
+            }
             ui.label("길이(ms):");
             ui.add(egui::DragValue::new(&mut self.sound_tab.new_duration_ms).range(20..=2000));
             if ui.button("+ 음표 추가").clicked() {
@@ -2302,6 +2584,23 @@ impl StudioApp {
                 self.sound_tab.commit_notes_change(next);
             }
         });
+
+        // 전체 음표 중 부저 권장 범위를 벗어난 항목이 있으면 상단 경고 배너 표시
+        let out_of_range_count = self
+            .sound_tab
+            .melody
+            .notes()
+            .iter()
+            .filter(|n| !is_valid_buzzer_freq(n.freq_hz))
+            .count();
+        if out_of_range_count > 0 {
+            ui.colored_label(
+                egui::Color32::from_rgb(240, 200, 80),
+                format!(
+                    "⚠ 경고: 부저 발음 범위({BUZZER_MIN_FREQ_HZ}~{BUZZER_MAX_FREQ_HZ}Hz)를 벗어난 음표가 {out_of_range_count}개 있습니다."
+                ),
+            );
+        }
         ui.separator();
 
         // 4) 음표 목록 순회 (인라인 값 수정·이동·삭제 모두 명령 객체로 일괄 기록)
@@ -2318,10 +2617,13 @@ impl StudioApp {
                     ui.label(format!("#{:02}", idx + 1));
                     ui.label("Hz:");
                     if ui
-                        .add(egui::DragValue::new(&mut note.freq_hz).range(0..=4000))
+                        .add(egui::DragValue::new(&mut note.freq_hz).range(0..=6000))
                         .changed()
                     {
                         edited_inline = true;
+                    }
+                    if !is_valid_buzzer_freq(note.freq_hz) {
+                        ui.colored_label(egui::Color32::from_rgb(240, 200, 80), "⚠ 범위 밖");
                     }
                     ui.label("ms:");
                     if ui
@@ -2500,6 +2802,7 @@ impl StudioApp {
         let header = format!("$ {}\n", format_command(&self.device_tab.dotbox_bin, &args));
         match spawn_command_streaming(&self.device_tab.dotbox_bin, &args, &work_dir) {
             Ok(running) => {
+                self.build_diagnostics.clear(); // 새 빌드/실행 시 이전 컴파일 문제 목록 초기화
                 self.device_tab.output_log = header; // 명령 헤더 표시 후 실시간 줄 추가
                 self.device_tab.running_cmd = Some(running);
             }
@@ -2519,6 +2822,81 @@ impl StudioApp {
                 .push_str("\n[중지됨] 사용자 요청으로 프로세스를 종료했습니다.\n");
         }
     }
+}
+
+// 단일 모듈(왼쪽 또는 오른쪽) 시리얼 로그 패널 렌더링 헬퍼
+fn show_serial_pane(
+    ui: &mut egui::Ui,
+    title: &str,
+    id_salt: &str,
+    monitor: &mut SerialMonitor,
+    search: &str,
+    project_root: Option<&Path>,
+    save_status: &mut String,
+) {
+    ui.horizontal(|ui| {
+        ui.strong(title);
+        ui.add_enabled(
+            !monitor.is_connected(),
+            egui::TextEdit::singleline(&mut monitor.port_name)
+                .hint_text("COM5")
+                .desired_width(68.0),
+        );
+        if monitor.is_connected() {
+            if ui.small_button("해제").clicked() {
+                monitor.disconnect();
+            }
+        } else if ui.small_button("연결").clicked() {
+            monitor.connect();
+        }
+
+        let pause_label = if monitor.paused {
+            format!("재개 (+{})", monitor.pending_count())
+        } else {
+            "일시 정지".to_string()
+        };
+        if ui.small_button(pause_label).clicked() {
+            monitor.toggle_pause();
+        }
+        if ui.small_button("지우기").clicked() {
+            monitor.clear();
+        }
+        if ui.small_button("저장").clicked()
+            && let Some(root) = project_root
+        {
+            let path = root.join(".dotbox").join(format!("{id_salt}.log"));
+            match monitor.save_to_file(&path) {
+                Ok(()) => *save_status = format!("저장 완료: {}", path.display()),
+                Err(err) => *save_status = format!("오류: {err}"),
+            }
+        }
+    });
+    ui.colored_label(egui::Color32::from_gray(145), &monitor.status);
+
+    let filtered = monitor.filtered_lines(search);
+    egui::ScrollArea::vertical()
+        .id_salt(id_salt)
+        .max_height(105.0)
+        .stick_to_bottom(!monitor.paused)
+        .show(ui, |ui| {
+            if filtered.is_empty() {
+                ui.colored_label(egui::Color32::from_gray(120), "(수신된 로그 없음)");
+            } else {
+                for line in filtered {
+                    if line.is_reboot_or_panic {
+                        // 패닉·재부팅 징후가 보이면 빨간색 굵은 글씨로 강조
+                        ui.label(
+                            egui::RichText::new(&line.text)
+                                .monospace()
+                                .strong()
+                                .color(egui::Color32::from_rgb(255, 95, 95)),
+                        );
+                    } else {
+                        ui.monospace(&line.text);
+                    }
+                }
+            }
+        });
 }
 
 // doctor 점검 수준별 표시 색상 반환
