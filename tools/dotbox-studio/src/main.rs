@@ -4,6 +4,7 @@ mod device;
 mod diagnostics; // cargo JSON 컴파일 진단 파싱 모듈 // 4순위: 환경 점검·포트 감지·플래시 로직 모듈
 mod editor; // 1순위: 스프라이트·화면 편집 로직 모듈
 mod font; // 2순위: 글꼴 변환·미리보기 로직 모듈
+mod scene; // 32×16 장면(화면) 임시 미리보기 모듈
 mod serial_log; // 왼쪽/오른쪽 모듈 시리얼 로그 수신·검색·저장 모듈
 mod settings; // 사용자 전역 설정 (최근 프로젝트, 창 크기, 밝기)
 mod sound; // 3순위: 효과음·멜로디 편집 및 재생 로직 모듈
@@ -29,6 +30,7 @@ use dotbox_tools::doctor::{Level, Report};
 use editor::{CanvasEditor, DrawTool, PALETTE, SpriteSnapshot, scale_brightness};
 use eframe::egui;
 use font::{FontConfig, FontConverter};
+use scene::{SceneItemKind, ScenePreview};
 use serial_log::SerialMonitor;
 use settings::UserSettings;
 use sound::{
@@ -224,6 +226,33 @@ impl Default for DeviceTabState {
     }
 }
 
+// 장면(화면) 미리보기 탭 전용 UI 상태 (파일로 저장하지 않는 임시 배치기)
+struct SceneTabState {
+    scene: ScenePreview,                       // 32×16 장면 레이어 데이터
+    selected_idx: Option<usize>,               // 현재 선택된 항목 인덱스 (캔버스 드래그 이동 대상)
+    selected_sprite_name: String,              // 추가할 프로젝트 스프라이트 이름
+    new_text: String,                          // 새로 추가할 텍스트 문구
+    new_text_color: Rgb,                       // 새로 추가할 텍스트 색상
+    use_loaded_font: bool,                     // true면 글꼴 탭에서 불러온 TTF/OTF 사용
+    status_message: String,                    // 스프라이트 불러오기 오류·안내 메시지
+    drag_anchor: Option<(i32, i32, i32, i32)>, // (시작 포인터 X, Y, 항목 원래 X, Y)
+}
+
+impl Default for SceneTabState {
+    fn default() -> Self {
+        Self {
+            scene: ScenePreview::new(),
+            selected_idx: None,
+            selected_sprite_name: String::new(),
+            new_text: "SCORE 00".to_string(),
+            new_text_color: Rgb::WHITE,
+            use_loaded_font: true,
+            status_message: String::new(),
+            drag_anchor: None,
+        }
+    }
+}
+
 // 시작 화면 전용 UI 상태 (폴더 열기 · 새 프로젝트 만들기 · 오류 표시)
 #[derive(Default)]
 struct StartScreenState {
@@ -264,6 +293,7 @@ struct StudioApp {
     font_tab: FontTabState,                  // 글꼴 변환기 상태
     sound_tab: SoundTabState,                // 효과음·멜로디 편집기 상태 (Undo/Redo 포함)
     device_tab: DeviceTabState,              // 기기 패널 상태
+    scene_tab: SceneTabState,                // 장면(화면) 미리보기 상태
     sprite_asset_name: String,               // 저장·불러올 스프라이트 이름 (sprites/<이름>.png)
     sprite_io_status: String,                // 저장/불러오기 결과 안내
     sprite_files: Vec<String>,               // 탐색기에 표시할 assets/sprites/*.png 목록
@@ -313,6 +343,7 @@ impl StudioApp {
             font_tab: FontTabState::default(),
             sound_tab: SoundTabState::default(),
             device_tab: DeviceTabState::default(),
+            scene_tab: SceneTabState::default(),
             sprite_asset_name: "player".to_string(),
             sprite_io_status: String::new(),
             sprite_files: Vec::new(),
@@ -366,6 +397,7 @@ impl StudioApp {
                 self.editing_icon = false;
                 self.anim_playing = false;
                 self.anim_elapsed_ms = 0.0;
+                self.scene_tab = SceneTabState::default();
                 self.asset_modal = None;
                 self.explorer_status.clear();
                 self.pending_confirm = None;
@@ -415,6 +447,7 @@ impl StudioApp {
         self.font_files.clear();
         self.other_files.clear();
         self.has_icon = false;
+        self.scene_tab = SceneTabState::default();
         self.asset_modal = None;
         self.explorer_status.clear();
         self.pending_confirm = None; // 확인 팝업 닫기
@@ -1765,6 +1798,7 @@ impl StudioApp {
             TabKind::SpriteEditor,
             TabKind::FontTool,
             TabKind::SoundTool,
+            TabKind::ScenePreview,
             TabKind::DevicePanel,
         ] {
             let label = TabManager::tab_label(kind, self.is_tab_dirty(kind));
@@ -3075,6 +3109,307 @@ impl StudioApp {
         }
     }
 
+    // 장면(화면) 미리보기 탭 화면 (32×16 스프라이트·텍스트 임시 배치, 파일 저장 안 함)
+    fn show_scene_tab(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.strong("장면 미리보기 (32×16)");
+            ui.colored_label(
+                egui::Color32::from_gray(145),
+                "임시 배치 전용 — 파일로 저장되지 않습니다.",
+            );
+        });
+        ui.add_space(4.0);
+
+        // 1) 배경색 · 폰트 소스 · 전체 비우기 바
+        ui.horizontal(|ui| {
+            ui.label("배경색:");
+            let mut bg = [
+                self.scene_tab.scene.background.r,
+                self.scene_tab.scene.background.g,
+                self.scene_tab.scene.background.b,
+            ];
+            if ui.color_edit_button_srgb(&mut bg).changed() {
+                self.scene_tab.scene.background = Rgb::new(bg[0], bg[1], bg[2]);
+            }
+
+            ui.separator();
+
+            let has_ttf = self.font_tab.converter.is_some();
+            ui.add_enabled(
+                has_ttf,
+                egui::Checkbox::new(&mut self.scene_tab.use_loaded_font, "글꼴 탭 TTF 사용"),
+            );
+            if !has_ttf {
+                ui.colored_label(
+                    egui::Color32::from_gray(140),
+                    "(기본: 내장 3×5 폰트 · 글꼴 탭에서 TTF 불러오면 전환 가능)",
+                );
+            }
+
+            ui.separator();
+            if ui.button("전체 비우기").clicked() {
+                self.scene_tab.scene.clear();
+                self.scene_tab.selected_idx = None;
+                self.scene_tab.drag_anchor = None;
+                self.scene_tab.status_message.clear();
+            }
+        });
+
+        // 2) 스프라이트 추가 바 (프로젝트 파일 또는 현재 편집 캔버스)
+        ui.horizontal(|ui| {
+            ui.label("스프라이트:");
+            if self.scene_tab.selected_sprite_name.is_empty()
+                && let Some(first) = self.sprite_files.first()
+            {
+                self.scene_tab.selected_sprite_name = first.clone();
+            }
+
+            egui::ComboBox::from_id_salt("scene_sprite_picker")
+                .selected_text(if self.scene_tab.selected_sprite_name.is_empty() {
+                    "(없음)".to_string()
+                } else {
+                    format!("{}.png", self.scene_tab.selected_sprite_name)
+                })
+                .show_ui(ui, |ui| {
+                    for name in &self.sprite_files {
+                        ui.selectable_value(
+                            &mut self.scene_tab.selected_sprite_name,
+                            name.clone(),
+                            format!("{name}.png"),
+                        );
+                    }
+                });
+
+            let can_add_file = !self.scene_tab.selected_sprite_name.is_empty();
+            if ui
+                .add_enabled(can_add_file, egui::Button::new("+ 스프라이트 추가"))
+                .clicked()
+                && let Some(assets_dir) = self.opened.as_ref().map(|o| o.project.assets_dir())
+            {
+                let name = self.scene_tab.selected_sprite_name.clone();
+                let path = assets_dir.join("sprites").join(format!("{name}.png"));
+                match load_sprite_png(&path) {
+                    Ok((w, h, pixels)) => {
+                        let idx = self.scene_tab.scene.add_sprite(name, w, h, pixels, 0, 0);
+                        self.scene_tab.selected_idx = Some(idx);
+                        self.scene_tab.status_message.clear();
+                    }
+                    Err(err) => self.scene_tab.status_message = format!("오류: {err}"),
+                }
+            }
+
+            if ui.button("+ 현재 캔버스 추가").clicked() {
+                let w = self.editor.width();
+                let h = self.editor.height();
+                let pixels = snapshot_canvas(&self.editor);
+                let label = if self.editing_icon {
+                    "icon".to_string()
+                } else {
+                    format!("canvas_{}", self.sprite_asset_name)
+                };
+                let idx = self.scene_tab.scene.add_sprite(label, w, h, pixels, 0, 0);
+                self.scene_tab.selected_idx = Some(idx);
+                self.scene_tab.status_message.clear();
+            }
+        });
+
+        // 3) 텍스트 추가 바
+        ui.horizontal(|ui| {
+            ui.label("텍스트:");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.scene_tab.new_text)
+                    .hint_text("예: SCORE 00")
+                    .desired_width(140.0),
+            );
+            let mut rgb = [
+                self.scene_tab.new_text_color.r,
+                self.scene_tab.new_text_color.g,
+                self.scene_tab.new_text_color.b,
+            ];
+            if ui.color_edit_button_srgb(&mut rgb).changed() {
+                self.scene_tab.new_text_color = Rgb::new(rgb[0], rgb[1], rgb[2]);
+            }
+            if ui.button("+ 텍스트 추가").clicked() {
+                let text = self.scene_tab.new_text.clone();
+                let idx = self
+                    .scene_tab
+                    .scene
+                    .add_text(text, 1, 1, self.scene_tab.new_text_color);
+                self.scene_tab.selected_idx = Some(idx);
+            }
+            if !self.scene_tab.status_message.is_empty() {
+                ui.colored_label(
+                    egui::Color32::from_rgb(240, 100, 100),
+                    &self.scene_tab.status_message,
+                );
+            }
+        });
+        ui.add_space(6.0);
+
+        // 4) 32×16 합성 미리보기 캔버스 (선택된 항목 드래그 이동 지원)
+        let active_font = if self.scene_tab.use_loaded_font {
+            self.font_tab.converter.as_ref()
+        } else {
+            None
+        };
+        let fb = self.scene_tab.scene.render(active_font);
+        let width = usize::from(fb.width());
+        let height = usize::from(fb.height());
+        let canvas_size = egui::vec2(width as f32 * CELL_SIZE, height as f32 * CELL_SIZE);
+        let (rect, response) = ui.allocate_exact_size(canvas_size, egui::Sense::click_and_drag());
+
+        if response.dragged_by(egui::PointerButton::Primary)
+            && let Some(pos) = response.interact_pointer_pos()
+            && let Some(sel) = self.scene_tab.selected_idx
+            && let Some(item) = self.scene_tab.scene.items.get_mut(sel)
+        {
+            let gx = ((pos.x - rect.min.x) / CELL_SIZE).floor() as i32;
+            let gy = ((pos.y - rect.min.y) / CELL_SIZE).floor() as i32;
+            let (start_gx, start_gy, orig_x, orig_y) = *self
+                .scene_tab
+                .drag_anchor
+                .get_or_insert((gx, gy, item.x, item.y));
+            item.x = (orig_x + (gx - start_gx)).clamp(-32, 32);
+            item.y = (orig_y + (gy - start_gy)).clamp(-16, 16);
+        } else if !response.dragged() {
+            self.scene_tab.drag_anchor = None;
+        }
+
+        let painter = ui.painter();
+        let grid_stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(45));
+        for y in 0..height {
+            for x in 0..width {
+                let cell_min = egui::pos2(
+                    rect.min.x + x as f32 * CELL_SIZE,
+                    rect.min.y + y as f32 * CELL_SIZE,
+                );
+                let cell_rect =
+                    egui::Rect::from_min_size(cell_min, egui::vec2(CELL_SIZE, CELL_SIZE));
+                let raw = fb.pixel(x as i32, y as i32).unwrap_or(Rgb::BLACK);
+                let display = if self.settings.led_preview {
+                    scale_brightness(raw, self.settings.brightness_percent)
+                } else {
+                    raw
+                };
+                painter.rect_filled(cell_rect, egui::CornerRadius::ZERO, to_color32(display));
+                painter.rect_stroke(
+                    cell_rect,
+                    egui::CornerRadius::ZERO,
+                    grid_stroke,
+                    egui::StrokeKind::Inside,
+                );
+            }
+        }
+        draw_panel_divider(painter, rect);
+
+        ui.add_space(4.0);
+        ui.colored_label(
+            egui::Color32::from_gray(145),
+            "팁: 아래 목록에서 항목을 선택한 뒤 32×16 화면 위를 드래그하면 위치를 바로 옮길 수 있습니다.",
+        );
+        ui.separator();
+
+        // 5) 배치된 레이어 목록 및 위치·속성·순서 편집
+        let len = self.scene_tab.scene.items.len();
+        if len == 0 {
+            ui.label("배치된 항목이 없습니다. 위에서 스프라이트나 텍스트를 추가하세요.");
+            return;
+        }
+
+        let mut move_up_idx = None;
+        let mut move_down_idx = None;
+        let mut remove_idx = None;
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for (idx, item) in self.scene_tab.scene.items.iter_mut().enumerate() {
+                let is_selected = self.scene_tab.selected_idx == Some(idx);
+                ui.horizontal(|ui| {
+                    if ui
+                        .selectable_label(
+                            is_selected,
+                            format!("#{} {}", idx + 1, item.display_label()),
+                        )
+                        .clicked()
+                    {
+                        self.scene_tab.selected_idx = Some(idx);
+                    }
+                    ui.checkbox(&mut item.visible, "표시");
+                    ui.label("X:");
+                    ui.add(egui::DragValue::new(&mut item.x).range(-32..=32));
+                    ui.label("Y:");
+                    ui.add(egui::DragValue::new(&mut item.y).range(-16..=16));
+
+                    match &mut item.kind {
+                        SceneItemKind::Sprite {
+                            transparent_black, ..
+                        } => {
+                            ui.checkbox(transparent_black, "검정 투명");
+                        }
+                        SceneItemKind::Text {
+                            text,
+                            color,
+                            pixel_size,
+                            ..
+                        } => {
+                            ui.add(egui::TextEdit::singleline(text).desired_width(90.0));
+                            let mut rgb = [color.r, color.g, color.b];
+                            if ui.color_edit_button_srgb(&mut rgb).changed() {
+                                *color = Rgb::new(rgb[0], rgb[1], rgb[2]);
+                            }
+                            if self.scene_tab.use_loaded_font && self.font_tab.converter.is_some() {
+                                ui.add(
+                                    egui::DragValue::new(pixel_size)
+                                        .range(6.0..=16.0)
+                                        .speed(0.5)
+                                        .suffix("px"),
+                                );
+                            }
+                        }
+                    }
+
+                    if ui.add_enabled(idx > 0, egui::Button::new("▲")).clicked() {
+                        move_up_idx = Some(idx);
+                    }
+                    if ui
+                        .add_enabled(idx + 1 < len, egui::Button::new("▼"))
+                        .clicked()
+                    {
+                        move_down_idx = Some(idx);
+                    }
+                    if ui.button("삭제").clicked() {
+                        remove_idx = Some(idx);
+                    }
+                });
+            }
+        });
+
+        if let Some(idx) = move_up_idx {
+            if self.scene_tab.scene.move_up(idx) {
+                self.scene_tab.selected_idx = match self.scene_tab.selected_idx {
+                    Some(sel) if sel == idx => Some(idx - 1),
+                    Some(sel) if sel == idx - 1 => Some(idx),
+                    other => other,
+                };
+            }
+        } else if let Some(idx) = move_down_idx {
+            if self.scene_tab.scene.move_down(idx) {
+                self.scene_tab.selected_idx = match self.scene_tab.selected_idx {
+                    Some(sel) if sel == idx => Some(idx + 1),
+                    Some(sel) if sel == idx + 1 => Some(idx),
+                    other => other,
+                };
+            }
+        } else if let Some(idx) = remove_idx
+            && self.scene_tab.scene.remove_item(idx)
+        {
+            self.scene_tab.selected_idx = match self.scene_tab.selected_idx {
+                Some(sel) if sel == idx => None,
+                Some(sel) if sel > idx => Some(sel - 1),
+                other => other,
+            };
+        }
+    }
+
     // 기기 패널 탭 화면 (열린 프로젝트 경로 고정 · 구조화 doctor · 실시간 실행/중지)
     fn show_device_tab(&mut self, ui: &mut egui::Ui) {
         let is_busy = self.device_tab.running_cmd.is_some();
@@ -3440,6 +3775,7 @@ impl eframe::App for StudioApp {
                 }
                 TabKind::FontTool => self.show_font_tab(ui), // 글꼴 변환·미리보기 탭
                 TabKind::SoundTool => self.show_sound_tab(ui), // 효과음·멜로디 편집 탭
+                TabKind::ScenePreview => self.show_scene_tab(ui), // 장면(화면) 미리보기 탭
                 TabKind::DevicePanel => self.show_device_tab(ui), // 기기 패널 탭
             }
         });

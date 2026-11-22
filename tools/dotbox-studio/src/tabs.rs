@@ -8,6 +8,7 @@ pub enum TabKind {
     FontTool,        // 글꼴 변환기
     SoundTool,       // 효과음·멜로디 편집기
     DevicePanel,     // 기기 패널
+    ScenePreview,    // 장면(화면) 미리보기 (임시 배치용)
 }
 
 impl TabKind {
@@ -20,6 +21,7 @@ impl TabKind {
             Self::FontTool => "글꼴 변환기",
             Self::SoundTool => "효과음 편집기",
             Self::DevicePanel => "기기 패널",
+            Self::ScenePreview => "장면 미리보기",
         }
     }
 
