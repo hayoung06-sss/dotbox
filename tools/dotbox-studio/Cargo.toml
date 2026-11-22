@@ -5,8 +5,14 @@ edition.workspace = true
 publish = false
 
 [dependencies]
+dotbox-tools = { path = "../dotbox-tools" }
 dotbox-core.workspace = true
 eframe = "0.37.0"
 fontdue = "0.9.5"
 rodio = "0.19"
 serialport = "4.10.1"
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.2.2"
+
+[dev-dependencies]
+tempfile = "3.27.0"
