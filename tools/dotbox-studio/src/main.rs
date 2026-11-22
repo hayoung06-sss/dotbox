@@ -24,7 +24,7 @@ use device::{
 use dotbox_core::display::{FrameBuffer, PANEL_WIDTH, ScreenLayout};
 use dotbox_core::hal::Rgb;
 use dotbox_tools::doctor::{Level, Report};
-use editor::{CanvasEditor, PALETTE, scale_brightness};
+use editor::{CanvasEditor, DrawTool, PALETTE, scale_brightness};
 use eframe::egui;
 use font::{FontConfig, FontConverter};
 use settings::UserSettings;
@@ -206,6 +206,8 @@ struct StudioApp {
     editor: CanvasEditor,           // 스프라이트·화면 편집기 상태
     canvas_history: CommandHistory<CanvasEditor>, // 스프라이트 탭 독립 Undo/Redo 이력
     canvas_drag_before: Option<Vec<Rgb>>, // 마우스 드래그 시작 시점의 캔버스 스냅샷
+    draw_tool: DrawTool,            // 현재 선택된 스프라이트 그리기 도구
+    shape_start: Option<(usize, usize)>, // 직선·사각형 드래그 시작 좌표
     font_tab: FontTabState,         // 글꼴 변환기 상태
     sound_tab: SoundTabState,       // 효과음·멜로디 편집기 상태 (Undo/Redo 포함)
     device_tab: DeviceTabState,     // 기기 패널 상태
@@ -242,6 +244,8 @@ impl StudioApp {
             editor,
             canvas_history: CommandHistory::new(), // 깨끗한 이력으로 초기화
             canvas_drag_before: None,              // 드래그 중 아님
+            draw_tool: DrawTool::Pencil,
+            shape_start: None,
             font_tab: FontTabState::default(),
             sound_tab: SoundTabState::default(),
             device_tab: DeviceTabState::default(),
@@ -436,16 +440,17 @@ impl StudioApp {
 
         if path.is_file() {
             match load_sprite_png(&path) {
-                Ok((16, 16, pixels)) => {
-                    self.editor.set_layout(ScreenLayout::Mirrored);
+                Ok((w, h, pixels)) if (1..=32).contains(&w) && (1..=16).contains(&h) => {
+                    self.editor.resize(w, h);
                     restore_canvas(&mut self.editor, &pixels);
                     self.canvas_history.reset();
                     self.canvas_drag_before = None;
-                    self.sprite_io_status = format!("아이콘 불러오기 완료: {}", path.display());
+                    self.shape_start = None;
+                    self.sprite_io_status = format!("불러오기 완료: {} ({w}×{h})", path.display());
                 }
                 Ok((w, h, _)) => {
                     self.sprite_io_status =
-                        format!("오류: icon.png는 16×16 크기여야 합니다 ({w}×{h}).");
+                        format!("오류: 지원 크기(1×1 ~ 32×16)를 벗어났습니다 ({w}×{h}).");
                 }
                 Err(err) => self.sprite_io_status = format!("오류: {err}"),
             }
@@ -1653,33 +1658,33 @@ impl StudioApp {
         });
     }
 
-    // 스프라이트 편집기 도구 모음 (화면 모드 전환 · 전체 지우기 · 실행 취소/다시 실행 · 파일 저장/불러오기)
+    // 스프라이트 편집기 도구 모음 (화면 모드 · 전체 지우기 · Undo/Redo · 크기 · 6종 도구 · 파일 저장)
     fn show_sprite_toolbar(&mut self, ui: &mut egui::Ui) {
+        // 1줄: 화면 모드 전환 · 전체 지우기 · 실행 취소/다시 실행
         ui.horizontal(|ui| {
             ui.label("화면 모드:");
             let is_wide = matches!(self.editor.layout(), ScreenLayout::Wide);
 
-            // Wide(32×16) 전환 버튼 (캔버스 크기가 바뀌므로 이력 초기화 및 아이콘 모드 해제)
             if ui.selectable_label(is_wide, "Wide (32×16)").clicked() && !is_wide {
                 self.editing_icon = false;
                 self.editor.set_layout(ScreenLayout::Wide);
                 self.canvas_history.reset();
                 self.canvas_drag_before = None;
+                self.shape_start = None;
             }
-            // Mirrored(16×16) 전환 버튼 (캔버스 크기가 바뀌므로 이력 초기화)
             if ui.selectable_label(!is_wide, "Mirrored (16×16)").clicked() && is_wide {
                 self.editor.set_layout(ScreenLayout::Mirrored);
                 self.canvas_history.reset();
                 self.canvas_drag_before = None;
+                self.shape_start = None;
             }
 
             ui.separator();
 
-            // 캔버스 전체 지우기를 명령 객체로 기록해 Ctrl+Z로 되돌릴 수 있게 처리
             if ui.button("전체 지우기").clicked() {
-                let before = snapshot_canvas(&mut self.editor); // 지우기 전 스냅샷
+                let before = snapshot_canvas(&mut self.editor);
                 self.editor.clear();
-                let after = snapshot_canvas(&mut self.editor); // 지운 후 스냅샷
+                let after = snapshot_canvas(&mut self.editor);
                 if before != after {
                     let cmd = Box::new(ReplaceCanvasCommand::new(before, after));
                     self.canvas_history.execute(&mut self.editor, cmd);
@@ -1688,7 +1693,6 @@ impl StudioApp {
 
             ui.separator();
 
-            // 스프라이트 실행 취소(Ctrl+Z) 버튼
             if ui
                 .add_enabled(
                     self.canvas_history.can_undo(),
@@ -1698,7 +1702,6 @@ impl StudioApp {
             {
                 self.canvas_history.undo(&mut self.editor);
             }
-            // 스프라이트 다시 실행(Ctrl+Y) 버튼
             if ui
                 .add_enabled(
                     self.canvas_history.can_redo(),
@@ -1710,7 +1713,45 @@ impl StudioApp {
             }
         });
 
-        // 스프라이트 / 아이콘 파일 저장·불러오기 바
+        // 2줄: 캔버스 크기 지정 (1×1 ~ 32×16) 및 6종 그리기 도구
+        ui.horizontal(|ui| {
+            ui.label("크기:");
+            let mut w = self.editor.width();
+            let mut h = self.editor.height();
+            let w_changed = ui
+                .add_enabled(
+                    !self.editing_icon,
+                    egui::DragValue::new(&mut w).range(1..=32).prefix("W:"),
+                )
+                .changed();
+            let h_changed = ui
+                .add_enabled(
+                    !self.editing_icon,
+                    egui::DragValue::new(&mut h).range(1..=16).prefix("H:"),
+                )
+                .changed();
+            if w_changed || h_changed {
+                self.editor.resize(w, h);
+                self.canvas_history.reset();
+                self.canvas_drag_before = None;
+                self.shape_start = None;
+            }
+
+            ui.separator();
+            ui.label("도구:");
+            for tool in [
+                DrawTool::Pencil,
+                DrawTool::Eraser,
+                DrawTool::Fill,
+                DrawTool::Eyedropper,
+                DrawTool::Line,
+                DrawTool::Rect,
+            ] {
+                ui.selectable_value(&mut self.draw_tool, tool, tool.label());
+            }
+        });
+
+        // 3줄: 스프라이트 / 아이콘 파일 저장·불러오기 바
         ui.horizontal(|ui| {
             if self.editing_icon {
                 ui.strong("아이콘 편집 모드 (assets/icon.png · 16×16)");
@@ -1792,28 +1833,75 @@ impl StudioApp {
 
         let (rect, response) = ui.allocate_exact_size(canvas_size, egui::Sense::click_and_drag());
 
-        // 마우스 입력 처리: 좌클릭/드래그 = 찍기, 우클릭/드래그 = 지우기
-        let primary_active = response.clicked_by(egui::PointerButton::Primary)
-            || response.dragged_by(egui::PointerButton::Primary);
+        // 마우스 입력 처리: 우클릭은 항상 빠른 지우개, 좌클릭은 선택된 도구 실행
+        let primary_clicked = response.clicked_by(egui::PointerButton::Primary);
+        let primary_active = primary_clicked || response.dragged_by(egui::PointerButton::Primary);
         let secondary_active = response.clicked_by(egui::PointerButton::Secondary)
             || response.dragged_by(egui::PointerButton::Secondary);
 
-        if primary_active || secondary_active {
-            // 이번 획이 막 시작됐다면 그리기 직전의 캔버스 스냅샷을 1회 저장
-            if self.canvas_drag_before.is_none() {
-                self.canvas_drag_before = Some(snapshot_canvas(&mut self.editor));
-            }
-            // 포인터 좌표에 해당하는 도트 칸 색칠 또는 지우기
-            if let Some(pointer_pos) = response.interact_pointer_pos() {
-                let rel = pointer_pos - rect.min;
-                if rel.x >= 0.0 && rel.y >= 0.0 {
-                    let x = (rel.x / CELL_SIZE) as usize;
-                    let y = (rel.y / CELL_SIZE) as usize;
-                    if x < width && y < height {
-                        if secondary_active {
-                            self.editor.erase_pixel(x, y); // 우클릭: 지우기
-                        } else {
-                            self.editor.paint_pixel(x, y); // 좌클릭: 찍기
+        if (primary_active || secondary_active)
+            && let Some(pointer_pos) = response.interact_pointer_pos()
+        {
+            let rel = pointer_pos - rect.min;
+            if rel.x >= 0.0 && rel.y >= 0.0 {
+                let x = (rel.x / CELL_SIZE) as usize;
+                let y = (rel.y / CELL_SIZE) as usize;
+                if x < width && y < height {
+                    if secondary_active {
+                        if self.canvas_drag_before.is_none() {
+                            self.canvas_drag_before = Some(snapshot_canvas(&mut self.editor));
+                        }
+                        self.editor.erase_pixel(x, y);
+                    } else {
+                        match self.draw_tool {
+                            DrawTool::Pencil => {
+                                if self.canvas_drag_before.is_none() {
+                                    self.canvas_drag_before =
+                                        Some(snapshot_canvas(&mut self.editor));
+                                }
+                                self.editor.paint_pixel(x, y);
+                            }
+                            DrawTool::Eraser => {
+                                if self.canvas_drag_before.is_none() {
+                                    self.canvas_drag_before =
+                                        Some(snapshot_canvas(&mut self.editor));
+                                }
+                                self.editor.erase_pixel(x, y);
+                            }
+                            DrawTool::Eyedropper => {
+                                self.editor.pick_color(x, y);
+                                self.draw_tool = DrawTool::Pencil; // 색 추출 후 연필로 복귀
+                            }
+                            DrawTool::Fill => {
+                                if primary_clicked {
+                                    let before = snapshot_canvas(&mut self.editor);
+                                    self.editor.flood_fill(x, y);
+                                    let after = snapshot_canvas(&mut self.editor);
+                                    if before != after {
+                                        let cmd =
+                                            Box::new(ReplaceCanvasCommand::new(before, after));
+                                        self.canvas_history.execute(&mut self.editor, cmd);
+                                    }
+                                }
+                            }
+                            DrawTool::Line | DrawTool::Rect => {
+                                if self.shape_start.is_none() {
+                                    self.shape_start = Some((x, y));
+                                    self.canvas_drag_before =
+                                        Some(snapshot_canvas(&mut self.editor));
+                                }
+                                // 드래그 중에는 원본 스냅샷 위에 실시간으로 도형 미리보기
+                                if let (Some((sx, sy)), Some(before)) =
+                                    (self.shape_start, self.canvas_drag_before.as_ref())
+                                {
+                                    restore_canvas(&mut self.editor, before);
+                                    if self.draw_tool == DrawTool::Line {
+                                        self.editor.draw_line(sx, sy, x, y);
+                                    } else {
+                                        self.editor.draw_rect(sx, sy, x, y);
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -1822,11 +1910,14 @@ impl StudioApp {
 
         // 마우스 클릭/드래그가 끝난 순간, 변경이 있었으면 1개의 명령 객체로 묶어 기록
         let stroke_finished = !response.dragged() && !response.is_pointer_button_down_on();
-        if stroke_finished && let Some(before) = self.canvas_drag_before.take() {
-            let after = snapshot_canvas(&mut self.editor);
-            if before != after {
-                let cmd = Box::new(ReplaceCanvasCommand::new(before, after));
-                self.canvas_history.execute(&mut self.editor, cmd);
+        if stroke_finished {
+            self.shape_start = None;
+            if let Some(before) = self.canvas_drag_before.take() {
+                let after = snapshot_canvas(&mut self.editor);
+                if before != after {
+                    let cmd = Box::new(ReplaceCanvasCommand::new(before, after));
+                    self.canvas_history.execute(&mut self.editor, cmd);
+                }
             }
         }
 
@@ -1855,7 +1946,7 @@ impl StudioApp {
         }
 
         // Wide(32×16) 모드일 때 중앙(x=16) 패널 경계선 표시
-        if matches!(self.editor.layout(), ScreenLayout::Wide) {
+        if width > usize::from(PANEL_WIDTH) {
             draw_panel_divider(painter, rect);
         }
     }

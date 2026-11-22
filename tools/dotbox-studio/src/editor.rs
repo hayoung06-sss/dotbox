@@ -13,17 +13,44 @@ pub const PALETTE: [Rgb; 8] = [
     Rgb::new(210, 80, 255), // 보라
 ];
 
+// 스프라이트 편집기 그리기 도구 종류
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DrawTool {
+    #[default]
+    Pencil, // 연필 (픽셀 찍기)
+    Eraser,     // 지우개 (검은색/꺼짐으로 지우기)
+    Fill,       // 채우기 (Flood Fill)
+    Eyedropper, // 스포이드 (클릭한 픽셀 색상 추출)
+    Line,       // 직선 (드래그 시작점 -> 끝점)
+    Rect,       // 사각형 테두리 (드래그 시작점 -> 끝점)
+}
+
+impl DrawTool {
+    // 도구 버튼에 표시할 이름 반환
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Pencil => "연필",
+            Self::Eraser => "지우개",
+            Self::Fill => "채우기",
+            Self::Eyedropper => "스포이드",
+            Self::Line => "직선",
+            Self::Rect => "사각형",
+        }
+    }
+}
+
 // GUI 없이 독립적으로 테스트할 수 있는 캔버스 편집기 상태
 pub struct CanvasEditor {
     framebuffer: FrameBuffer, // 엔진 프레임버퍼 (미리보기 일치 보장)
-    layout: ScreenLayout,     // 현재 화면 모드 (Wide 32x16 / Mirrored 16x16)
+    layout: ScreenLayout,     // 현재 내부 레이아웃 (Wide 32x16 / Mirrored 16x16)
+    canvas_width: usize,      // 실제 편집 중인 가로 크기 (1~32)
+    canvas_height: usize,     // 실제 편집 중인 세로 크기 (1~16)
     selected_color: Rgb,      // 현재 선택된 브러시 색상
     led_preview: bool,        // 실기기 LED 밝기 미리보기 켜기/끄기
     brightness_percent: u8,   // 실기기 밝기 제한 시뮬레이션 (15~25%)
 }
 
 impl Default for CanvasEditor {
-    // 기본값 생성 시 new() 호출
     fn default() -> Self {
         Self::new()
     }
@@ -35,20 +62,22 @@ impl CanvasEditor {
         Self {
             framebuffer: FrameBuffer::new(ScreenLayout::Wide),
             layout: ScreenLayout::Wide,
+            canvas_width: 32,
+            canvas_height: 16,
             selected_color: PALETTE[1],
             led_preview: false,
             brightness_percent: 20,
         }
     }
 
-    // 현재 캔버스 가로 픽셀 수 반환 (u16 → usize 변환)
+    // 현재 캔버스 가로 픽셀 수 반환 (1~32)
     pub fn width(&self) -> usize {
-        usize::from(self.framebuffer.width())
+        self.canvas_width
     }
 
-    // 현재 캔버스 세로 픽셀 수 반환 (u16 → usize 변환)
+    // 현재 캔버스 세로 픽셀 수 반환 (1~16)
     pub fn height(&self) -> usize {
-        usize::from(self.framebuffer.height())
+        self.canvas_height
     }
 
     // 현재 화면 레이아웃 모드 반환 (Wide / Mirrored)
@@ -85,10 +114,51 @@ impl CanvasEditor {
     pub fn set_layout(&mut self, layout: ScreenLayout) {
         self.layout = layout;
         self.framebuffer = FrameBuffer::new(layout);
+        self.canvas_width = usize::from(self.framebuffer.width());
+        self.canvas_height = usize::from(self.framebuffer.height());
+    }
+
+    // 캔버스 크기를 1×1 ~ 32×16 범위로 변경 (기존 픽셀은 겹치는 영역만큼 유지)
+    pub fn resize(&mut self, width: usize, height: usize) {
+        let new_w = width.clamp(1, 32);
+        let new_h = height.clamp(1, 16);
+        let old_w = self.canvas_width;
+        let old_h = self.canvas_height;
+
+        // 기존 픽셀 백업
+        let mut old_pixels = Vec::with_capacity(old_w * old_h);
+        for y in 0..old_h {
+            for x in 0..old_w {
+                old_pixels.push(self.pixel(x, y));
+            }
+        }
+
+        // 새 크기에 맞는 최소 레이아웃으로 프레임버퍼 재구성
+        self.layout = if new_w <= 16 {
+            ScreenLayout::Mirrored
+        } else {
+            ScreenLayout::Wide
+        };
+        self.framebuffer = FrameBuffer::new(self.layout);
+        self.canvas_width = new_w;
+        self.canvas_height = new_h;
+
+        // 겹치는 영역의 기존 픽셀 복원
+        for y in 0..old_h.min(new_h) {
+            for x in 0..old_w.min(new_w) {
+                let color = old_pixels[y * old_w + x];
+                if let (Ok(ix), Ok(iy)) = (i32::try_from(x), i32::try_from(y)) {
+                    self.framebuffer.set_pixel(ix, iy, color);
+                }
+            }
+        }
     }
 
     // 지정한 좌표(x, y)에 현재 선택된 색으로 픽셀 찍기
     pub fn paint_pixel(&mut self, x: usize, y: usize) {
+        if x >= self.canvas_width || y >= self.canvas_height {
+            return;
+        }
         if let (Ok(x), Ok(y)) = (i32::try_from(x), i32::try_from(y)) {
             self.framebuffer.set_pixel(x, y, self.selected_color);
         }
@@ -96,8 +166,99 @@ impl CanvasEditor {
 
     // 지정한 좌표(x, y)의 픽셀을 검은색(LED 꺼짐)으로 지우기
     pub fn erase_pixel(&mut self, x: usize, y: usize) {
+        if x >= self.canvas_width || y >= self.canvas_height {
+            return;
+        }
         if let (Ok(x), Ok(y)) = (i32::try_from(x), i32::try_from(y)) {
             self.framebuffer.set_pixel(x, y, Rgb::BLACK);
+        }
+    }
+
+    // 스포이드: 지정한 좌표의 색을 읽어 현재 브러시 색으로 설정
+    pub fn pick_color(&mut self, x: usize, y: usize) -> Rgb {
+        let color = self.pixel(x, y);
+        self.selected_color = color;
+        color
+    }
+
+    // 채우기(Flood Fill): 시작점과 같은 색으로 연결된 인접 영역을 현재 색으로 채움
+    pub fn flood_fill(&mut self, start_x: usize, start_y: usize) {
+        if start_x >= self.canvas_width || start_y >= self.canvas_height {
+            return;
+        }
+        let target = self.pixel(start_x, start_y);
+        let replacement = self.selected_color;
+        if target == replacement {
+            return; // 이미 같은 색이면 무한 루프 방지를 위해 즉시 종료
+        }
+
+        let mut stack = vec![(start_x, start_y)];
+        while let Some((x, y)) = stack.pop() {
+            if self.pixel(x, y) != target {
+                continue;
+            }
+            self.paint_pixel(x, y);
+            if x > 0 {
+                stack.push((x - 1, y));
+            }
+            if x + 1 < self.canvas_width {
+                stack.push((x + 1, y));
+            }
+            if y > 0 {
+                stack.push((x, y - 1));
+            }
+            if y + 1 < self.canvas_height {
+                stack.push((x, y + 1));
+            }
+        }
+    }
+
+    // 직선 그리기 (브레젠험 알고리즘)
+    pub fn draw_line(&mut self, x0: usize, y0: usize, x1: usize, y1: usize) {
+        let mut x = x0 as isize;
+        let mut y = y0 as isize;
+        let tx = x1 as isize;
+        let ty = y1 as isize;
+
+        let dx = (tx - x).abs();
+        let dy = -(ty - y).abs();
+        let sx = if x < tx { 1 } else { -1 };
+        let sy = if y < ty { 1 } else { -1 };
+        let mut err = dx + dy;
+
+        loop {
+            if x >= 0 && y >= 0 {
+                self.paint_pixel(x as usize, y as usize);
+            }
+            if x == tx && y == ty {
+                break;
+            }
+            let e2 = 2 * err;
+            if e2 >= dy {
+                err += dy;
+                x += sx;
+            }
+            if e2 <= dx {
+                err += dx;
+                y += sy;
+            }
+        }
+    }
+
+    // 사각형 테두리 그리기
+    pub fn draw_rect(&mut self, x0: usize, y0: usize, x1: usize, y1: usize) {
+        let min_x = x0.min(x1);
+        let max_x = x0.max(x1);
+        let min_y = y0.min(y1);
+        let max_y = y0.max(y1);
+
+        for x in min_x..=max_x {
+            self.paint_pixel(x, min_y);
+            self.paint_pixel(x, max_y);
+        }
+        for y in min_y..=max_y {
+            self.paint_pixel(min_x, y);
+            self.paint_pixel(max_x, y);
         }
     }
 
@@ -108,6 +269,9 @@ impl CanvasEditor {
 
     // 특정 좌표의 원본 색상 읽기
     pub fn pixel(&self, x: usize, y: usize) -> Rgb {
+        if x >= self.canvas_width || y >= self.canvas_height {
+            return Rgb::BLACK;
+        }
         let (Ok(x), Ok(y)) = (i32::try_from(x), i32::try_from(y)) else {
             return Rgb::BLACK;
         };
@@ -138,37 +302,32 @@ pub fn scale_brightness(color: Rgb, percent: u8) -> Rgb {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // 엔진에 정의된 화면·패널 표준 크기 상수(32, 16) 불러오기
     use dotbox_core::display::{PANEL_HEIGHT, PANEL_WIDTH, SCREEN_HEIGHT, SCREEN_WIDTH};
 
-    // 픽셀 찍기와 지우기가 정상 동작하는지 검증
     #[test]
     fn paint_and_erase_pixel() {
-        let mut editor = CanvasEditor::new(); // 기본 편집기 생성
-        let red = Rgb::new(255, 0, 0); // 테스트용 빨간색 정의
-        editor.set_selected_color(red); // 브러시 색을 빨간색으로 변경
+        let mut editor = CanvasEditor::new();
+        let red = Rgb::new(255, 0, 0);
+        editor.set_selected_color(red);
 
-        editor.paint_pixel(5, 3); // (5, 3) 좌표에 빨간 픽셀 찍기
-        assert_eq!(editor.pixel(5, 3), red); // 실제로 빨간색이 저장됐는지 확인
+        editor.paint_pixel(5, 3);
+        assert_eq!(editor.pixel(5, 3), red);
 
-        editor.erase_pixel(5, 3); // (5, 3) 좌표 픽셀 지우기
-        assert_eq!(editor.pixel(5, 3), Rgb::BLACK); // 검은색(꺼짐)으로 돌아왔는지 확인
+        editor.erase_pixel(5, 3);
+        assert_eq!(editor.pixel(5, 3), Rgb::BLACK);
     }
 
-    // 화면 모드(Wide → Mirrored) 전환 시 크기 변경과 초기화를 검증
     #[test]
     fn changing_layout_resizes_and_clears_canvas() {
         let mut editor = CanvasEditor::new();
-        // 초기 모드는 Wide(32x16)인지 확인
         assert_eq!(
             (editor.width(), editor.height()),
             (usize::from(SCREEN_WIDTH), usize::from(SCREEN_HEIGHT))
         );
 
-        editor.paint_pixel(1, 1); // 임시로 (1, 1)에 점 하나 찍기
-        editor.set_layout(ScreenLayout::Mirrored); // Mirrored(16x16) 모드로 전환
+        editor.paint_pixel(1, 1);
+        editor.set_layout(ScreenLayout::Mirrored);
 
-        // 크기가 16x16으로 줄고, 기존에 찍었던 픽셀이 초기화됐는지 확인
         assert_eq!(
             (editor.width(), editor.height()),
             (usize::from(PANEL_WIDTH), usize::from(PANEL_HEIGHT))
@@ -176,10 +335,61 @@ mod tests {
         assert_eq!(editor.pixel(1, 1), Rgb::BLACK);
     }
 
-    // 실기기 밝기 제한(15~25%) 계산이 정확한지 검증
+    #[test]
+    fn resize_clamps_bounds_and_preserves_pixels() {
+        let mut editor = CanvasEditor::new();
+        let green = Rgb::new(0, 255, 0);
+        editor.set_selected_color(green);
+        editor.paint_pixel(2, 3);
+
+        editor.resize(8, 8);
+        assert_eq!((editor.width(), editor.height()), (8, 8));
+        assert_eq!(editor.pixel(2, 3), green);
+
+        // 범위 밖 크기는 1~32, 1~16으로 보정
+        editor.resize(0, 99);
+        assert_eq!((editor.width(), editor.height()), (1, 16));
+    }
+
+    #[test]
+    fn flood_fill_fills_connected_region_only() {
+        let mut editor = CanvasEditor::new();
+        editor.resize(5, 5);
+        let white = Rgb::WHITE;
+        let blue = Rgb::new(0, 0, 255);
+
+        // x=2 세로선으로 좌/우 분리
+        editor.set_selected_color(white);
+        editor.draw_line(2, 0, 2, 4);
+
+        // 왼쪽 영역(0, 0)만 파란색으로 채우기
+        editor.set_selected_color(blue);
+        editor.flood_fill(0, 0);
+
+        assert_eq!(editor.pixel(1, 2), blue); // 왼쪽은 채워짐
+        assert_eq!(editor.pixel(2, 2), white); // 경계선은 유지
+        assert_eq!(editor.pixel(3, 2), Rgb::BLACK); // 오른쪽은 그대로
+    }
+
+    #[test]
+    fn draw_rect_and_eyedropper_work() {
+        let mut editor = CanvasEditor::new();
+        editor.resize(6, 6);
+        let yellow = Rgb::new(255, 255, 0);
+        editor.set_selected_color(yellow);
+        editor.draw_rect(1, 1, 4, 4);
+
+        assert_eq!(editor.pixel(1, 1), yellow); // 모서리
+        assert_eq!(editor.pixel(2, 2), Rgb::BLACK); // 내부는 비어 있음
+
+        editor.set_selected_color(Rgb::WHITE);
+        let picked = editor.pick_color(4, 4);
+        assert_eq!(picked, yellow);
+        assert_eq!(editor.selected_color(), yellow);
+    }
+
     #[test]
     fn led_preview_scales_brightness() {
-        // RGB(200, 100, 50)에 20% 밝기를 적용하면 (40, 20, 10)이 되어야 함
         let dimmed = scale_brightness(Rgb::new(200, 100, 50), 20);
         assert_eq!(dimmed, Rgb::new(40, 20, 10));
     }
