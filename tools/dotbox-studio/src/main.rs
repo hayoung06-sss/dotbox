@@ -1,10 +1,14 @@
+mod command; // GUI 독립 편집 명령 객체 및 실행 취소/다시 실행 모듈
 mod device; // 4순위: 환경 점검·포트 감지·플래시 로직 모듈
 mod editor; // 1순위: 스프라이트·화면 편집 로직 모듈
 mod font; // 2순위: 글꼴 변환·미리보기 로직 모듈
 mod settings; // 사용자 전역 설정 (최근 프로젝트, 창 크기, 밝기)
 mod sound; // 3순위: 효과음·멜로디 편집 및 재생 로직 모듈
+mod tabs; // 파일 단위 탭 및 더티(●) 상태 관리 모듈
 mod workspace; // 프로젝트 열기·생성·설정 저장·doctor 실행 모듈
 
+// 명령 객체, 이력 관리자, 캔버스 스냅샷 헬퍼 불러오기
+use command::{CommandHistory, ReplaceCanvasCommand, ReplaceMelodyCommand, snapshot_canvas};
 use device::{
     DetectedPort, FlashTarget, build_doctor_args, build_flash_args, build_run_args,
     run_command_async, scan_serial_ports,
@@ -19,22 +23,11 @@ use settings::UserSettings;
 use sound::{MelodyEditor, NOTE_PRESETS, play_melody_async};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, TryRecvError};
+use tabs::{TabKind, TabManager};
 use workspace::{EngineSourceKind, NewProjectDraft, OpenedProject, run_doctor_async};
 
 // 캔버스 한 칸(도트 1개)의 화면 픽셀 크기
 const CELL_SIZE: f32 = 24.0;
-
-// 중앙 작업 공간 탭 종류 (프로젝트 열면 개요 탭이 기본)
-#[derive(Default, PartialEq, Eq)]
-enum ActiveTab {
-    #[default]
-    Overview, // 프로젝트 개요 (dotbox.toml · doctor · 포트/build_id)
-    ProjectSettings, // 프로젝트 설정 (dotbox.toml [paths] · 좌/우 포트)
-    SpriteEditor,    // 스프라이트·화면 편집기
-    FontTool,        // 글꼴 변환과 미리보기
-    SoundTool,       // 효과음·멜로디 편집기
-    DevicePanel,     // 기기 패널 (CLI 실행 · 포트 · 플래시)
-}
 
 // 하단 패널 탭 종류
 #[derive(Default, PartialEq, Eq)]
@@ -42,6 +35,13 @@ enum BottomTab {
     #[default]
     Output, // CLI 실행 출력 로그
     Problems, // doctor 점검 오류·경고 문제 목록
+}
+
+// 저장하지 않은 변경 사항이 있을 때 사용자 확인을 기다리는 대기 동작
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PendingConfirm {
+    CloseTab(TabKind), // 미저장 탭 하나 닫기 확인
+    CloseProject,      // 미저장 탭이 있는 상태에서 프로젝트 닫기 확인
 }
 
 // 프로젝트 설정 탭 전용 편집 폼 상태
@@ -94,21 +94,44 @@ impl Default for FontTabState {
     }
 }
 
-// 효과음·멜로디 탭 전용 UI 상태
+// 효과음·멜로디 탭 전용 UI 상태 (독립된 실행 취소/다시 실행 이력 포함)
 struct SoundTabState {
-    melody: MelodyEditor, // 음표 시퀀스 편집기
-    new_freq_hz: u16,     // 새로 추가할 음표의 주파수 (Hz)
-    new_duration_ms: u16, // 새로 추가할 음표의 길이 (ms)
+    melody: MelodyEditor,                  // 음표 시퀀스 편집기
+    history: CommandHistory<MelodyEditor>, // 파일별 독립 Undo/Redo 이력
+    new_freq_hz: u16,                      // 새로 추가할 음표의 주파수 (Hz)
+    new_duration_ms: u16,                  // 새로 추가할 음표의 길이 (ms)
 }
 
 impl Default for SoundTabState {
-    // 기본 음표 입력값(도 523Hz, 150ms)으로 초기화
+    // 기본 음표 입력값(도 523Hz, 150ms)과 빈 이력으로 초기화
     fn default() -> Self {
         Self {
             melody: MelodyEditor::default(),
+            history: CommandHistory::new(),
             new_freq_hz: 523,
             new_duration_ms: 150,
         }
+    }
+}
+
+impl SoundTabState {
+    // 현재 음표 목록을 (주파수, 길이) 스냅샷 벡터로 추출
+    fn snapshot_notes(&self) -> Vec<(u16, u16)> {
+        self.melody
+            .notes()
+            .iter()
+            .map(|n| (n.freq_hz, n.duration_ms))
+            .collect()
+    }
+
+    // 음표 목록 변경을 명령 객체로 감싸 실행 및 Undo 스택에 기록
+    fn commit_notes_change(&mut self, after: Vec<(u16, u16)>) {
+        let before = self.snapshot_notes(); // 변경 전 스냅샷
+        if before == after {
+            return; // 변화가 없으면 불필요한 이력을 남기지 않음
+        }
+        let cmd = Box::new(ReplaceMelodyCommand::new(before, after));
+        self.history.execute(&mut self.melody, cmd); // 명령 실행 및 이력 추가
     }
 }
 
@@ -163,12 +186,15 @@ struct StudioApp {
     doctor_report: Option<Report>,  // 마지막 doctor::run 점검 결과
     doctor_rx: Option<Receiver<Report>>, // 백그라운드 doctor 실행 수신기
     doctor_host_only: bool,         // 시뮬레이터 전용 점검 옵션 여부
-    active_tab: ActiveTab,          // 현재 열려 있는 중앙 탭
+    tabs: TabManager,               // 파일 단위 중앙 탭 관리자
+    pending_confirm: Option<PendingConfirm>, // 미저장 탭/프로젝트 닫기 확인 팝업 상태
     bottom_tab: BottomTab,          // 현재 열려 있는 하단 패널 탭
     show_bottom_panel: bool,        // 하단 패널 펼침 여부
     editor: CanvasEditor,           // 스프라이트·화면 편집기 상태
+    canvas_history: CommandHistory<CanvasEditor>, // 스프라이트 탭 독립 Undo/Redo 이력
+    canvas_drag_before: Option<Vec<Rgb>>, // 마우스 드래그 시작 시점의 캔버스 스냅샷
     font_tab: FontTabState,         // 글꼴 변환기 상태
-    sound_tab: SoundTabState,       // 효과음·멜로디 편집기 상태
+    sound_tab: SoundTabState,       // 효과음·멜로디 편집기 상태 (Undo/Redo 포함)
     device_tab: DeviceTabState,     // 기기 패널 상태
 }
 
@@ -188,10 +214,13 @@ impl StudioApp {
             doctor_report: None,
             doctor_rx: None,
             doctor_host_only: false,
-            active_tab: ActiveTab::Overview, // 프로젝트 열면 개요 탭부터 시작
+            tabs: TabManager::new(), // [개요] 탭 기본 열림
+            pending_confirm: None,
             bottom_tab: BottomTab::Output,
             show_bottom_panel: true, // 하단 패널 기본 표시
             editor,
+            canvas_history: CommandHistory::new(), // 깨끗한 이력으로 초기화
+            canvas_drag_before: None,              // 드래그 중 아님
             font_tab: FontTabState::default(),
             sound_tab: SoundTabState::default(),
             device_tab: DeviceTabState::default(),
@@ -219,9 +248,13 @@ impl StudioApp {
                 // 최근 프로젝트 목록 맨 앞에 추가 후 사용자 설정 저장
                 self.settings.push_recent(root);
                 let _ = self.settings.save();
-                // 열린 프로젝트 저장 후 개요 탭으로 전환
+                // 새 프로젝트를 열 때 탭·편집 이력 초기화 후 [개요] 탭 활성화
                 self.opened = Some(opened);
-                self.active_tab = ActiveTab::Overview;
+                self.tabs = TabManager::new();
+                self.sound_tab.history.reset();
+                self.canvas_history.reset(); // 스프라이트 편집 이력 초기화
+                self.canvas_drag_before = None;
+                self.pending_confirm = None;
                 self.start_screen.error_message = None;
                 // 프로젝트 열기 직후 환경 점검(doctor)을 백그라운드로 자동 시작
                 self.start_doctor_check();
@@ -234,11 +267,80 @@ impl StudioApp {
         }
     }
 
-    // 현재 프로젝트 닫고 시작 화면으로 돌아가기
-    fn close_project(&mut self) {
+    // 프로젝트 닫기 요청: 저장하지 않은 탭이 있으면 확인 팝업을 먼저 표시
+    fn request_close_project(&mut self) {
+        if self.tabs.has_any_dirty(|kind| self.is_tab_dirty(kind)) {
+            self.pending_confirm = Some(PendingConfirm::CloseProject); // 확인 팝업 띄우기
+        } else {
+            self.force_close_project(); // 미저장 변경이 없으면 바로 닫기
+        }
+    }
+
+    // 확인 없이 즉시 프로젝트를 닫고 시작 화면으로 복귀
+    fn force_close_project(&mut self) {
         self.opened = None; // 열린 프로젝트 비우기
-        self.doctor_report = None; // 이전 프로젝트의 doctor 결과 정리
-        self.doctor_rx = None; // 진행 중이던 doctor 수신기 정리
+        self.doctor_report = None; // doctor 결과 정리
+        self.doctor_rx = None; // doctor 수신기 정리
+        self.tabs = TabManager::new(); // 탭 목록 초기화
+        self.sound_tab.history.reset(); // 효과음 편집 이력 초기화
+        self.canvas_history.reset(); // 스프라이트 편집 이력 초기화
+        self.canvas_drag_before = None;
+        self.pending_confirm = None; // 확인 팝업 닫기
+    }
+
+    // 특정 탭 닫기 요청: 저장하지 않은 변경이 있으면 확인 팝업 표시
+    fn request_close_tab(&mut self, kind: TabKind) {
+        if !kind.is_closable() {
+            return; // 개요 탭은 닫기 불가
+        }
+        if self.is_tab_dirty(kind) {
+            self.pending_confirm = Some(PendingConfirm::CloseTab(kind)); // 확인 팝업 띄우기
+        } else {
+            self.tabs.close(kind); // 변경 없으면 바로 닫기
+        }
+    }
+
+    // 특정 탭에 저장되지 않은 변경 사항(●)이 있는지 조회
+    fn is_tab_dirty(&self, kind: TabKind) -> bool {
+        match kind {
+            TabKind::SpriteEditor => self.canvas_history.is_dirty(), // 스프라이트 이력 기준
+            TabKind::SoundTool => self.sound_tab.history.is_dirty(), // 효과음 이력 기준
+            _ => false,                                              // 그 외 탭은 읽기/즉시 저장
+        }
+    }
+
+    // 전역 키보드 단축키(Ctrl+Z 실행 취소, Ctrl+Y / Ctrl+Shift+Z 다시 실행) 처리
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        // 텍스트 입력칸에 포커스가 있을 때는 텍스트 자체의 Ctrl+Z와 충돌하지 않도록 건너뜀
+        if ctx.egui_wants_keyboard_input() {
+            return;
+        }
+
+        let (want_undo, want_redo) = ctx.input(|i| {
+            let undo = i.modifiers.command && !i.modifiers.shift && i.key_pressed(egui::Key::Z);
+            let redo = (i.modifiers.command && i.key_pressed(egui::Key::Y))
+                || (i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::Z));
+            (undo, redo)
+        });
+
+        // 현재 활성 탭에 맞는 독립 이력에 Undo/Redo 적용
+        match self.tabs.active() {
+            TabKind::SpriteEditor => {
+                if want_undo {
+                    self.canvas_history.undo(&mut self.editor); // 스프라이트 실행 취소
+                } else if want_redo {
+                    self.canvas_history.redo(&mut self.editor); // 스프라이트 다시 실행
+                }
+            }
+            TabKind::SoundTool => {
+                if want_undo {
+                    self.sound_tab.history.undo(&mut self.sound_tab.melody); // 효과음 실행 취소
+                } else if want_redo {
+                    self.sound_tab.history.redo(&mut self.sound_tab.melody); // 효과음 다시 실행
+                }
+            }
+            _ => {}
+        }
     }
 
     // 현재 열린 프로젝트 기준으로 dotbox_tools::doctor::run 비동기 시작
@@ -296,6 +398,93 @@ impl StudioApp {
                 self.device_tab.ports.clear();
                 self.device_tab.port_status = err;
             }
+        }
+    }
+
+    // 저장하지 않은 변경 사항 닫기 확인 모달 창 표시
+    fn show_confirm_dialog(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.pending_confirm else {
+            return; // 확인 대기 중인 동작이 없으면 표시 안 함
+        };
+
+        let message = match pending {
+            PendingConfirm::CloseTab(kind) => {
+                format!(
+                    "'{}' 탭에 저장하지 않은 변경 사항이 있습니다.\n변경 사항을 버리고 닫을까요?",
+                    kind.title()
+                )
+            }
+            PendingConfirm::CloseProject => {
+                "저장하지 않은 탭이 있습니다.\n변경 사항을 버리고 프로젝트를 닫을까요?".to_string()
+            }
+        };
+
+        // 화면 중앙에 고정된 확인 팝업 표시
+        egui::Window::new("저장하지 않은 변경 사항")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.label(message);
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button("버리고 닫기").clicked() {
+                        match pending {
+                            PendingConfirm::CloseTab(kind) => {
+                                // 탭을 닫고 해당 편집기 이력 초기화
+                                if kind == TabKind::SoundTool {
+                                    self.sound_tab.history.reset();
+                                }
+                                if kind == TabKind::SpriteEditor {
+                                    self.canvas_history.reset(); // 스프라이트 이력 초기화
+                                    self.canvas_drag_before = None;
+                                }
+                                self.tabs.close(kind);
+                                self.pending_confirm = None;
+                            }
+                            PendingConfirm::CloseProject => {
+                                self.force_close_project(); // 프로젝트 강제 닫기
+                            }
+                        }
+                    }
+                    if ui.button("취소").clicked() {
+                        self.pending_confirm = None; // 닫기 취소
+                    }
+                });
+            });
+    }
+
+    // 중앙 작업 공간 상단의 파일 단위 탭 바 렌더링 ([개요] [효과음 편집기 ● ×] ...)
+    fn show_editor_tab_bar(&mut self, ui: &mut egui::Ui) {
+        let open_tabs = self.tabs.open_tabs().to_vec(); // 순회 중 변경 충돌 방지 복사본
+        let active = self.tabs.active();
+        let mut activate_target: Option<TabKind> = None;
+        let mut close_target: Option<TabKind> = None;
+
+        ui.horizontal_wrapped(|ui| {
+            for kind in open_tabs {
+                let dirty = self.is_tab_dirty(kind); // 더티 상태 조회
+                let label = TabManager::tab_label(kind, dirty); // 더티면 뒤에 ● 추가
+                let is_active = kind == active;
+
+                // 탭 이름 클릭 시 활성화
+                if ui.selectable_label(is_active, label).clicked() {
+                    activate_target = Some(kind);
+                }
+                // 닫기 가능한 탭에만 × 버튼 표시
+                if kind.is_closable() && ui.small_button("×").clicked() {
+                    close_target = Some(kind);
+                }
+                ui.separator();
+            }
+        });
+
+        // 루프 종료 후 탭 전환 및 닫기 요청 반영
+        if let Some(kind) = activate_target {
+            self.tabs.set_active(kind);
+        }
+        if let Some(kind) = close_target {
+            self.request_close_tab(kind);
         }
     }
 
@@ -611,18 +800,26 @@ impl StudioApp {
         want_close
     }
 
-    // 좌측 프로젝트 탐색기 패널 렌더링 (명세서 3장)
+    // 좌측 프로젝트 탐색기 패널 렌더링 (클릭 시 해당 탭 열기/전환)
     fn show_explorer_panel(&mut self, ui: &mut egui::Ui) {
+        let active = self.tabs.active(); // 현재 활성 탭
+
         ui.heading("탐색기");
         ui.separator();
 
         // 프로젝트 관리 항목
-        ui.selectable_value(&mut self.active_tab, ActiveTab::Overview, "개요");
-        ui.selectable_value(
-            &mut self.active_tab,
-            ActiveTab::ProjectSettings,
-            "프로젝트 설정",
-        );
+        if ui
+            .selectable_label(active == TabKind::Overview, "개요")
+            .clicked()
+        {
+            self.tabs.open(TabKind::Overview);
+        }
+        if ui
+            .selectable_label(active == TabKind::ProjectSettings, "프로젝트 설정")
+            .clicked()
+        {
+            self.tabs.open(TabKind::ProjectSettings);
+        }
 
         ui.add_space(8.0);
         ui.label("에셋 (S2 합의 후 활성화)");
@@ -634,15 +831,18 @@ impl StudioApp {
         ui.add_space(8.0);
         ui.separator();
         ui.label("도구");
-        // 기존 1~4순위 도구 탭 전환 항목
-        ui.selectable_value(
-            &mut self.active_tab,
-            ActiveTab::SpriteEditor,
-            "스프라이트 편집기",
-        );
-        ui.selectable_value(&mut self.active_tab, ActiveTab::FontTool, "글꼴 변환기");
-        ui.selectable_value(&mut self.active_tab, ActiveTab::SoundTool, "효과음 편집기");
-        ui.selectable_value(&mut self.active_tab, ActiveTab::DevicePanel, "기기 패널");
+        // 기존 1~4순위 도구 탭 열기/전환
+        for kind in [
+            TabKind::SpriteEditor,
+            TabKind::FontTool,
+            TabKind::SoundTool,
+            TabKind::DevicePanel,
+        ] {
+            let label = TabManager::tab_label(kind, self.is_tab_dirty(kind));
+            if ui.selectable_label(active == kind, label).clicked() {
+                self.tabs.open(kind);
+            }
+        }
     }
 
     // 하단 패널 렌더링 ([출력] · [문제 N])
@@ -708,13 +908,13 @@ impl StudioApp {
                         ui.label("발견된 문제가 없습니다.");
                     }
                     if jump_to_overview {
-                        self.active_tab = ActiveTab::Overview;
+                        self.tabs.open(TabKind::Overview); // 개요 탭 열기
                     }
                 }
             });
     }
 
-    // S1-3: 개요 탭 화면 (명세서 4.2)
+    // 개요 탭 화면 (명세서 4.2)
     fn show_overview_tab(&mut self, ui: &mut egui::Ui) {
         let Some(opened) = self.opened.clone() else {
             return;
@@ -799,7 +999,6 @@ impl StudioApp {
                                         check.message
                                     ),
                                 );
-                                // 힌트가 있는 항목은 들여쓰기해 안내 표시
                                 if let Some(hint) = &check.hint {
                                     ui.label(format!("    힌트: {hint}"));
                                 }
@@ -837,7 +1036,7 @@ impl StudioApp {
                 }
 
                 if ui.button("포트 설정으로 이동").clicked() {
-                    self.active_tab = ActiveTab::ProjectSettings;
+                    self.tabs.open(TabKind::ProjectSettings); // 설정 탭 열기
                 }
             });
             ui.add_space(6.0);
@@ -857,7 +1056,7 @@ impl StudioApp {
         });
     }
 
-    // S1-3: 프로젝트 설정 탭 화면 (명세서 4.3)
+    // 프로젝트 설정 탭 화면 (명세서 4.3)
     fn show_project_settings_tab(&mut self, ui: &mut egui::Ui) {
         let Some(project_name) = self.opened.as_ref().map(|o| o.project.name().to_string()) else {
             return;
@@ -924,11 +1123,11 @@ impl StudioApp {
                     ) {
                         Ok(()) => {
                             self.settings_form.status_message =
-                                "dotbox.toml 경로 설정을 저장했습니다.".to_string(); // 성공 안내
+                                "dotbox.toml 경로 설정을 저장했습니다.".to_string();
                             self.settings_form.error_message.clear();
                         }
                         Err(err) => {
-                            self.settings_form.error_message = err; // 실패 이유 표시
+                            self.settings_form.error_message = err;
                             self.settings_form.status_message.clear();
                         }
                     }
@@ -992,11 +1191,11 @@ impl StudioApp {
                             self.device_tab.selected_port =
                                 opened.local_config.ports.left.clone().unwrap_or_default();
                             self.settings_form.status_message =
-                                ".dotbox/local.toml 포트 설정을 저장했습니다.".to_string(); // 성공 안내
+                                ".dotbox/local.toml 포트 설정을 저장했습니다.".to_string();
                             self.settings_form.error_message.clear();
                         }
                         Err(err) => {
-                            self.settings_form.error_message = err; // 실패 이유 표시
+                            self.settings_form.error_message = err;
                             self.settings_form.status_message.clear();
                         }
                     }
@@ -1005,26 +1204,59 @@ impl StudioApp {
         });
     }
 
-    // 스프라이트 편집기 도구 모음 (화면 모드 전환 · 전체 지우기)
+    // 스프라이트 편집기 도구 모음 (화면 모드 전환 · 전체 지우기 · 실행 취소/다시 실행)
     fn show_sprite_toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label("화면 모드:");
             let is_wide = matches!(self.editor.layout(), ScreenLayout::Wide);
 
-            // Wide(32×16) 전환 버튼
+            // Wide(32×16) 전환 버튼 (캔버스 크기가 바뀌므로 이력 초기화)
             if ui.selectable_label(is_wide, "Wide (32×16)").clicked() && !is_wide {
                 self.editor.set_layout(ScreenLayout::Wide);
+                self.canvas_history.reset();
+                self.canvas_drag_before = None;
             }
-            // Mirrored(16×16) 전환 버튼
+            // Mirrored(16×16) 전환 버튼 (캔버스 크기가 바뀌므로 이력 초기화)
             if ui.selectable_label(!is_wide, "Mirrored (16×16)").clicked() && is_wide {
                 self.editor.set_layout(ScreenLayout::Mirrored);
+                self.canvas_history.reset();
+                self.canvas_drag_before = None;
             }
 
             ui.separator();
 
-            // 캔버스 전체를 검은색으로 초기화
+            // 캔버스 전체 지우기를 명령 객체로 기록해 Ctrl+Z로 되돌릴 수 있게 처리
             if ui.button("전체 지우기").clicked() {
+                let before = snapshot_canvas(&mut self.editor); // 지우기 전 스냅샷
                 self.editor.clear();
+                let after = snapshot_canvas(&mut self.editor); // 지운 후 스냅샷
+                if before != after {
+                    let cmd = Box::new(ReplaceCanvasCommand::new(before, after));
+                    self.canvas_history.execute(&mut self.editor, cmd);
+                }
+            }
+
+            ui.separator();
+
+            // 스프라이트 실행 취소(Ctrl+Z) 버튼
+            if ui
+                .add_enabled(
+                    self.canvas_history.can_undo(),
+                    egui::Button::new("↶ 실행 취소 (Ctrl+Z)"),
+                )
+                .clicked()
+            {
+                self.canvas_history.undo(&mut self.editor);
+            }
+            // 스프라이트 다시 실행(Ctrl+Y) 버튼
+            if ui
+                .add_enabled(
+                    self.canvas_history.can_redo(),
+                    egui::Button::new("↷ 다시 실행 (Ctrl+Y)"),
+                )
+                .clicked()
+            {
+                self.canvas_history.redo(&mut self.editor);
             }
         });
     }
@@ -1082,23 +1314,40 @@ impl StudioApp {
         let (rect, response) = ui.allocate_exact_size(canvas_size, egui::Sense::click_and_drag());
 
         // 마우스 입력 처리: 좌클릭/드래그 = 찍기, 우클릭/드래그 = 지우기
-        if let Some(pointer_pos) = response.interact_pointer_pos() {
-            let rel = pointer_pos - rect.min;
-            if rel.x >= 0.0 && rel.y >= 0.0 {
-                let x = (rel.x / CELL_SIZE) as usize;
-                let y = (rel.y / CELL_SIZE) as usize;
+        let primary_active = response.clicked_by(egui::PointerButton::Primary)
+            || response.dragged_by(egui::PointerButton::Primary);
+        let secondary_active = response.clicked_by(egui::PointerButton::Secondary)
+            || response.dragged_by(egui::PointerButton::Secondary);
 
-                if x < width && y < height {
-                    if response.clicked_by(egui::PointerButton::Secondary)
-                        || response.dragged_by(egui::PointerButton::Secondary)
-                    {
-                        self.editor.erase_pixel(x, y); // 우클릭: 지우기
-                    } else if response.clicked_by(egui::PointerButton::Primary)
-                        || response.dragged_by(egui::PointerButton::Primary)
-                    {
-                        self.editor.paint_pixel(x, y); // 좌클릭: 찍기
+        if primary_active || secondary_active {
+            // 이번 획이 막 시작됐다면 그리기 직전의 캔버스 스냅샷을 1회 저장
+            if self.canvas_drag_before.is_none() {
+                self.canvas_drag_before = Some(snapshot_canvas(&mut self.editor));
+            }
+            // 포인터 좌표에 해당하는 도트 칸 색칠 또는 지우기
+            if let Some(pointer_pos) = response.interact_pointer_pos() {
+                let rel = pointer_pos - rect.min;
+                if rel.x >= 0.0 && rel.y >= 0.0 {
+                    let x = (rel.x / CELL_SIZE) as usize;
+                    let y = (rel.y / CELL_SIZE) as usize;
+                    if x < width && y < height {
+                        if secondary_active {
+                            self.editor.erase_pixel(x, y); // 우클릭: 지우기
+                        } else {
+                            self.editor.paint_pixel(x, y); // 좌클릭: 찍기
+                        }
                     }
                 }
+            }
+        }
+
+        // 마우스 클릭/드래그가 끝난 순간, 변경이 있었으면 1개의 명령 객체로 묶어 기록
+        let stroke_finished = !response.dragged() && !response.is_pointer_button_down_on();
+        if stroke_finished && let Some(before) = self.canvas_drag_before.take() {
+            let after = snapshot_canvas(&mut self.editor);
+            if before != after {
+                let cmd = Box::new(ReplaceCanvasCommand::new(before, after));
+                self.canvas_history.execute(&mut self.editor, cmd);
             }
         }
 
@@ -1199,15 +1448,39 @@ impl StudioApp {
         }
     }
 
-    // 효과음·멜로디 편집기 탭 화면
+    // 효과음·멜로디 편집기 탭 화면 (모든 변경을 명령 객체로 기록해 Ctrl+Z/Y 지원)
     fn show_sound_tab(&mut self, ui: &mut egui::Ui) {
+        // 1) 상단 재생·초기화·실행 취소/다시 실행 버튼 바
         ui.horizontal(|ui| {
             if ui.button("▶ 전체 재생").clicked() {
                 play_melody_async(self.sound_tab.melody.notes().to_vec());
             }
             if ui.button("전체 지우기").clicked() {
-                self.sound_tab.melody.clear();
+                self.sound_tab.commit_notes_change(Vec::new()); // 빈 목록으로 명령 실행
             }
+            ui.separator();
+
+            // 실행 취소(Ctrl+Z) 버튼
+            if ui
+                .add_enabled(
+                    self.sound_tab.history.can_undo(),
+                    egui::Button::new("↶ 실행 취소 (Ctrl+Z)"),
+                )
+                .clicked()
+            {
+                self.sound_tab.history.undo(&mut self.sound_tab.melody);
+            }
+            // 다시 실행(Ctrl+Y) 버튼
+            if ui
+                .add_enabled(
+                    self.sound_tab.history.can_redo(),
+                    egui::Button::new("↷ 다시 실행 (Ctrl+Y)"),
+                )
+                .clicked()
+            {
+                self.sound_tab.history.redo(&mut self.sound_tab.melody);
+            }
+
             ui.separator();
             ui.label(format!(
                 "음표: {}개 | 총 길이: {} ms",
@@ -1217,31 +1490,35 @@ impl StudioApp {
         });
         ui.add_space(6.0);
 
+        // 2) 빠른 음계 프리셋 추가 (명령 객체로 기록)
         ui.horizontal(|ui| {
             ui.label("빠른 추가:");
             for (name, freq_hz) in NOTE_PRESETS {
                 if ui.button(name).clicked() {
-                    self.sound_tab
-                        .melody
-                        .add_note(freq_hz, self.sound_tab.new_duration_ms);
+                    let mut next = self.sound_tab.snapshot_notes();
+                    next.push((freq_hz, self.sound_tab.new_duration_ms));
+                    self.sound_tab.commit_notes_change(next);
                 }
             }
         });
 
+        // 3) 직접 주파수·길이 입력 후 추가 (명령 객체로 기록)
         ui.horizontal(|ui| {
             ui.label("주파수(Hz, 0=쉼표):");
             ui.add(egui::DragValue::new(&mut self.sound_tab.new_freq_hz).range(0..=4000));
             ui.label("길이(ms):");
             ui.add(egui::DragValue::new(&mut self.sound_tab.new_duration_ms).range(20..=2000));
             if ui.button("+ 음표 추가").clicked() {
-                self.sound_tab
-                    .melody
-                    .add_note(self.sound_tab.new_freq_hz, self.sound_tab.new_duration_ms);
+                let mut next = self.sound_tab.snapshot_notes();
+                next.push((self.sound_tab.new_freq_hz, self.sound_tab.new_duration_ms));
+                self.sound_tab.commit_notes_change(next);
             }
         });
         ui.separator();
 
-        // 순회 중 변경 충돌 방지를 위한 임시 인덱스 변수
+        // 4) 음표 목록 순회 (인라인 값 수정·이동·삭제 모두 명령 객체로 일괄 기록)
+        let before_snapshot = self.sound_tab.snapshot_notes(); // 루프 전 스냅샷
+        let mut edited_inline = false; // DragValue로 값이 바뀌었는지 추적
         let mut remove_idx = None;
         let mut move_up_idx = None;
         let mut move_down_idx = None;
@@ -1252,12 +1529,22 @@ impl StudioApp {
                 ui.horizontal(|ui| {
                     ui.label(format!("#{:02}", idx + 1));
                     ui.label("Hz:");
-                    ui.add(egui::DragValue::new(&mut note.freq_hz).range(0..=4000));
+                    if ui
+                        .add(egui::DragValue::new(&mut note.freq_hz).range(0..=4000))
+                        .changed()
+                    {
+                        edited_inline = true;
+                    }
                     ui.label("ms:");
-                    ui.add(egui::DragValue::new(&mut note.duration_ms).range(20..=2000));
+                    if ui
+                        .add(egui::DragValue::new(&mut note.duration_ms).range(20..=2000))
+                        .changed()
+                    {
+                        edited_inline = true;
+                    }
 
                     if ui.button("▶").clicked() {
-                        play_melody_async(vec![*note]);
+                        play_melody_async(vec![*note]); // 단일 음표 미리 듣기
                     }
                     if ui.add_enabled(idx > 0, egui::Button::new("▲")).clicked() {
                         move_up_idx = Some(idx);
@@ -1275,15 +1562,25 @@ impl StudioApp {
             }
         });
 
-        // 루프 종료 후 예약된 이동·삭제 반영
+        // 루프 내 이동·삭제 요청을 MelodyEditor 메서드로 직접 적용
         if let Some(idx) = move_up_idx {
-            self.sound_tab.melody.move_up(idx);
+            self.sound_tab.melody.move_up(idx); // 선택한 음표를 한 칸 위로 이동
+        } else if let Some(idx) = move_down_idx {
+            self.sound_tab.melody.move_down(idx); // 선택한 음표를 한 칸 아래로 이동
+        } else if let Some(idx) = remove_idx {
+            self.sound_tab.melody.remove_note(idx); // 선택한 음표 삭제
         }
-        if let Some(idx) = move_down_idx {
-            self.sound_tab.melody.move_down(idx);
-        }
-        if let Some(idx) = remove_idx {
-            self.sound_tab.melody.remove_note(idx);
+
+        // 인라인 수정·이동·삭제 중 하나라도 발생해 음표가 바뀌었으면 명령 객체로 기록
+        if edited_inline || move_up_idx.is_some() || move_down_idx.is_some() || remove_idx.is_some()
+        {
+            let after_snapshot = self.sound_tab.snapshot_notes(); // 변경 후 음표 스냅샷 추출
+            if before_snapshot != after_snapshot {
+                let cmd = Box::new(ReplaceMelodyCommand::new(before_snapshot, after_snapshot));
+                self.sound_tab
+                    .history
+                    .execute(&mut self.sound_tab.melody, cmd); // Undo/Redo 이력에 기록
+            }
         }
     }
 
@@ -1472,7 +1769,6 @@ fn to_color32(color: Rgb) -> egui::Color32 {
 }
 
 // 매 프레임 화면을 갱신하는 egui 루프
-// 매 프레임 화면을 갱신하는 egui 루프
 impl eframe::App for StudioApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // 백그라운드 작업(doctor, CLI) 완료 여부 매 프레임 확인
@@ -1486,52 +1782,64 @@ impl eframe::App for StudioApp {
             return;
         }
 
-        // 1) 상단 도구 모음 패널 (egui 0.37 통합 Panel::top 사용)
-        let mut want_close = false; // 프로젝트 닫기 클릭 여부 기록
+        // 전역 단축키(Ctrl+Z / Ctrl+Y) 입력 처리
+        self.handle_shortcuts(ui.ctx());
+
+        // 1) 상단 도구 모음 패널
+        let mut want_close = false;
         egui::Panel::top("top_toolbar").show(ui, |ui| {
-            want_close = self.show_top_bar(ui); // 상단 바 렌더링 및 닫기 요청 수신
+            want_close = self.show_top_bar(ui); // 상단 바 렌더링
         });
-        // 닫기 버튼이 눌렸으면 프로젝트를 닫고 다음 프레임부터 시작 화면 표시
         if want_close {
-            self.close_project();
-            return;
+            self.request_close_project(); // 미저장 탭 확인 후 닫기 처리
         }
 
         // 2) 하단 패널 ([출력] · [문제 N]) — 표시 옵션이 켜져 있을 때만 렌더링
         if self.show_bottom_panel {
             egui::Panel::bottom("bottom_panel")
-                .resizable(true) // 사용자가 경계선을 끌어 높이 조절 가능
-                .default_size(150.0) // 기본 패널 높이 150px
+                .resizable(true)
+                .default_size(150.0)
                 .show(ui, |ui| {
-                    self.show_bottom_panel(ui); // 하단 출력·문제 패널 렌더링
+                    self.show_bottom_panel(ui); // 하단 패널 렌더링
                 });
         }
 
-        // 3) 좌측 프로젝트 탐색기 패널 (egui 0.37 통합 Panel::left 사용)
+        // 3) 좌측 프로젝트 탐색기 패널
         egui::Panel::left("explorer_panel")
-            .resizable(true) // 사용자가 경계선을 끌어 너비 조절 가능
-            .default_size(180.0) // 기본 패널 너비 180px
+            .resizable(true)
+            .default_size(180.0)
             .show(ui, |ui| {
                 self.show_explorer_panel(ui); // 좌측 탐색기 렌더링
             });
 
-        // 4) 중앙 작업 공간 패널 (남은 영역 전체에 선택된 탭 표시)
-        egui::CentralPanel::default().show(ui, |ui| match self.active_tab {
-            ActiveTab::Overview => self.show_overview_tab(ui), // 프로젝트 개요 탭
-            ActiveTab::ProjectSettings => self.show_project_settings_tab(ui), // 프로젝트 설정 탭
-            ActiveTab::SpriteEditor => {
-                self.show_sprite_toolbar(ui); // 화면 모드·초기화 도구 모음
-                ui.add_space(6.0);
-                self.show_palette(ui); // 색상 팔레트 및 컬러 피커
-                ui.add_space(10.0);
-                self.show_canvas(ui); // 32×16 또는 16×16 도트 캔버스
-                ui.add_space(8.0);
-                ui.label("조작: 마우스 왼쪽 클릭/드래그 = 픽셀 찍기 | 오른쪽 클릭/드래그 = 지우기");
+        // 4) 중앙 작업 공간 패널 (상단 탭 바 + 활성 탭 편집기)
+        egui::CentralPanel::default().show(ui, |ui| {
+            self.show_editor_tab_bar(ui); // 파일 단위 탭 바 표시
+            ui.separator();
+            ui.add_space(4.0);
+
+            match self.tabs.active() {
+                TabKind::Overview => self.show_overview_tab(ui), // 프로젝트 개요 탭
+                TabKind::ProjectSettings => self.show_project_settings_tab(ui), // 프로젝트 설정 탭
+                TabKind::SpriteEditor => {
+                    self.show_sprite_toolbar(ui); // 화면 모드·초기화 도구 모음
+                    ui.add_space(6.0);
+                    self.show_palette(ui); // 색상 팔레트 및 컬러 피커
+                    ui.add_space(10.0);
+                    self.show_canvas(ui); // 도트 캔버스
+                    ui.add_space(8.0);
+                    ui.label(
+                        "조작: 마우스 왼쪽 클릭/드래그 = 픽셀 찍기 | 오른쪽 클릭/드래그 = 지우기",
+                    );
+                }
+                TabKind::FontTool => self.show_font_tab(ui), // 글꼴 변환·미리보기 탭
+                TabKind::SoundTool => self.show_sound_tab(ui), // 효과음·멜로디 편집 탭
+                TabKind::DevicePanel => self.show_device_tab(ui), // 기기 패널 탭
             }
-            ActiveTab::FontTool => self.show_font_tab(ui), // 글꼴 변환·미리보기 탭
-            ActiveTab::SoundTool => self.show_sound_tab(ui), // 효과음·멜로디 편집 탭
-            ActiveTab::DevicePanel => self.show_device_tab(ui), // 기기 패널 탭
         });
+
+        // 5) 미저장 변경 사항 닫기 확인 모달 표시 (필요 시)
+        self.show_confirm_dialog(ui.ctx());
     }
 }
 
