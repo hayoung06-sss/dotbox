@@ -3,7 +3,36 @@ use dotbox_core::hal::Rgb;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+// 4.4 규칙: 에셋 탐색기에서 관리하는 에셋 종류
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssetKind {
+    Sprite, // assets/sprites/<name>.png
+    Sound,  // assets/sounds/<name>.sound.toml
+    Font,   // assets/fonts/<name>.font.toml
+}
+
+impl AssetKind {
+    // UI에 표시할 에셋 종류 이름
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Sprite => "스프라이트 (.png)",
+            Self::Sound => "효과음 (.sound.toml)",
+            Self::Font => "글꼴 (.font.toml)",
+        }
+    }
+
+    // assets_dir 기준 해당 에셋의 실제 파일 경로 계산
+    pub fn asset_path(self, assets_dir: &Path, name: &str) -> PathBuf {
+        match self {
+            Self::Sprite => assets_dir.join("sprites").join(format!("{name}.png")),
+            Self::Sound => assets_dir.join("sounds").join(format!("{name}.sound.toml")),
+            Self::Font => assets_dir.join("fonts").join(format!("{name}.font.toml")),
+        }
+    }
+}
 
 // 4.4 규칙: 에셋 이름은 ASCII 소문자로 시작하고 소문자·숫자·'_'만 허용
 pub fn validate_asset_name(name: &str) -> Result<(), String> {
@@ -21,6 +50,197 @@ pub fn validate_asset_name(name: &str) -> Result<(), String> {
         return Err("에셋 이름은 영문 소문자, 숫자, '_'만 사용할 수 있습니다.".to_string());
     }
     Ok(())
+}
+
+// 새 에셋을 기본 템플릿으로 생성 (이미 같은 이름이 있으면 오류 반환)
+pub fn create_default_asset(
+    assets_dir: &Path,
+    kind: AssetKind,
+    name: &str,
+) -> Result<PathBuf, String> {
+    validate_asset_name(name)?;
+    let path = kind.asset_path(assets_dir, name);
+    if path.exists() {
+        return Err(format!("이미 존재하는 에셋입니다: {name}"));
+    }
+
+    match kind {
+        AssetKind::Sprite => {
+            // 기본 16×16 빈(검은색) 스프라이트 PNG 생성
+            let pixels = vec![Rgb::BLACK; 16 * 16];
+            save_sprite_png(&path, 16, 16, &pixels)?;
+        }
+        AssetKind::Sound => {
+            // 기본 2음표(도-솔) 효과음 TOML 생성
+            let notes = vec![Note::new(523, 120), Note::new(784, 120)];
+            save_sound_toml(&path, &notes)?;
+        }
+        AssetKind::Font => {
+            // 기본 글꼴 변환 설정 TOML 생성
+            let data = FontAssetFile {
+                source: r"C:\Windows\Fonts\malgun.ttf".to_string(),
+                pixel_size: 12.0,
+                threshold: 128,
+                charset: "DotBox 0123456789".to_string(),
+                license: "OFL-1.1".to_string(),
+            };
+            save_font_toml(&path, &data)?;
+        }
+    }
+    Ok(path)
+}
+
+// 기존 에셋의 이름 변경 (식별자 규칙 검사 및 중복 방지 포함)
+pub fn rename_asset(
+    assets_dir: &Path,
+    kind: AssetKind,
+    old_name: &str,
+    new_name: &str,
+) -> Result<PathBuf, String> {
+    validate_asset_name(new_name)?;
+    if old_name == new_name {
+        return Err("새 이름이 기존 이름과 같습니다.".to_string());
+    }
+    let old_path = kind.asset_path(assets_dir, old_name);
+    if !old_path.is_file() {
+        return Err(format!(
+            "원본 에셋 파일을 찾을 수 없습니다: {}",
+            old_path.display()
+        ));
+    }
+    let new_path = kind.asset_path(assets_dir, new_name);
+    if new_path.exists() {
+        return Err(format!("이미 존재하는 에셋 이름입니다: {new_name}"));
+    }
+    fs::rename(&old_path, &new_path).map_err(|e| {
+        format!(
+            "에셋 이름 변경 실패 ({} -> {}): {e}",
+            old_path.display(),
+            new_path.display()
+        )
+    })?;
+    Ok(new_path)
+}
+
+// 기존 에셋을 새 이름으로 복제 (식별자 규칙 검사 및 중복 방지 포함)
+pub fn duplicate_asset(
+    assets_dir: &Path,
+    kind: AssetKind,
+    src_name: &str,
+    dst_name: &str,
+) -> Result<PathBuf, String> {
+    validate_asset_name(dst_name)?;
+    let src_path = kind.asset_path(assets_dir, src_name);
+    if !src_path.is_file() {
+        return Err(format!(
+            "원본 에셋 파일을 찾을 수 없습니다: {}",
+            src_path.display()
+        ));
+    }
+    let dst_path = kind.asset_path(assets_dir, dst_name);
+    if dst_path.exists() {
+        return Err(format!("이미 존재하는 에셋 이름입니다: {dst_name}"));
+    }
+    fs::copy(&src_path, &dst_path).map_err(|e| {
+        format!(
+            "에셋 복제 실패 ({} -> {}): {e}",
+            src_path.display(),
+            dst_path.display()
+        )
+    })?;
+    Ok(dst_path)
+}
+
+// 지정한 에셋 파일 삭제
+pub fn delete_asset(assets_dir: &Path, kind: AssetKind, name: &str) -> Result<(), String> {
+    let path = kind.asset_path(assets_dir, name);
+    if !path.is_file() {
+        return Err(format!(
+            "삭제할 에셋 파일을 찾을 수 없습니다: {}",
+            path.display()
+        ));
+    }
+    fs::remove_file(&path).map_err(|e| format!("에셋 삭제 실패 ({}): {e}", path.display()))
+}
+
+// assets/ 내에서 알 수 없는 종류의 파일 목록을 수집 ("기타" 표시용)
+pub fn list_other_files(assets_dir: &Path) -> Vec<String> {
+    let mut others = Vec::new();
+
+    // 1) assets/ 루트의 알 수 없는 파일 (icon.png 제외)
+    if let Ok(entries) = fs::read_dir(assets_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file()
+                && let Some(name) = path.file_name().and_then(|n| n.to_str())
+                && name != "icon.png"
+            {
+                others.push(name.to_string());
+            }
+        }
+    }
+
+    // 2) 하위 폴더별 예상 외 확장자 파일 수집
+    type KnownAssetCheck = fn(&str) -> bool;
+    let subdirs: [(&str, KnownAssetCheck); 3] = [
+        ("sprites", |n| {
+            n.ends_with(".png") || n.ends_with(".sprite.toml")
+        }),
+        ("sounds", |n| n.ends_with(".sound.toml")),
+        ("fonts", |n| {
+            n.ends_with(".font.toml") || n.ends_with(".ttf") || n.ends_with(".otf")
+        }),
+    ];
+
+    for (sub, is_known) in subdirs {
+        let dir = assets_dir.join(sub);
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file()
+                    && let Some(name) = path.file_name().and_then(|n| n.to_str())
+                    && !is_known(name)
+                {
+                    others.push(format!("{sub}/{name}"));
+                }
+            }
+        }
+    }
+
+    others.sort();
+    others
+}
+
+// OS 기본 파일 탐색기로 지정한 폴더 열기 (폴더가 없으면 자동 생성 후 열기)
+pub fn open_in_file_explorer(dir: &Path) -> Result<(), String> {
+    if !dir.exists() {
+        fs::create_dir_all(dir).map_err(|e| format!("폴더 생성 실패 ({}): {e}", dir.display()))?;
+    }
+
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        let mut c = Command::new("explorer");
+        c.arg(dir);
+        c
+    };
+
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
+        let mut c = Command::new("open");
+        c.arg(dir);
+        c
+    };
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut cmd = {
+        let mut c = Command::new("xdg-open");
+        c.arg(dir);
+        c
+    };
+
+    cmd.spawn()
+        .map(|_| ())
+        .map_err(|e| format!("탐색기 실행 실패 ({}): {e}", dir.display()))
 }
 
 // 스프라이트 픽셀 배열을 RGB8 PNG 파일로 저장 (상위 폴더 자동 생성)
@@ -244,7 +464,7 @@ pub fn has_icon_png(assets_dir: &Path) -> bool {
     assets_dir.join("icon.png").is_file()
 }
 
-// GUI 없이 이름 검사·PNG 왕복·TOML 왕복을 검증하는 단위 테스트
+// GUI 없이 이름 검사·PNG 왕복·TOML 왕복·탐색기 CRUD를 검증하는 단위 테스트
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,5 +525,49 @@ mod tests {
         save_font_toml(&path, &font).unwrap();
         let loaded = load_font_toml(&path).unwrap();
         assert_eq!(loaded, font);
+    }
+
+    // 에셋 생성·중복 방지·이름 변경·복제·삭제 전체 흐름 검증
+    #[test]
+    fn create_rename_duplicate_delete_asset_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let assets = dir.path();
+
+        // 1) 기본 스프라이트 생성 및 중복 생성 거부 확인
+        create_default_asset(assets, AssetKind::Sprite, "hero").unwrap();
+        assert!(create_default_asset(assets, AssetKind::Sprite, "hero").is_err());
+        assert_eq!(list_sprite_names(assets), vec!["hero"]);
+
+        // 2) 복제 확인
+        duplicate_asset(assets, AssetKind::Sprite, "hero", "hero_copy").unwrap();
+        assert_eq!(list_sprite_names(assets), vec!["hero", "hero_copy"]);
+
+        // 3) 이름 변경 확인
+        rename_asset(assets, AssetKind::Sprite, "hero_copy", "enemy").unwrap();
+        assert_eq!(list_sprite_names(assets), vec!["enemy", "hero"]);
+
+        // 4) 삭제 확인
+        delete_asset(assets, AssetKind::Sprite, "enemy").unwrap();
+        assert_eq!(list_sprite_names(assets), vec!["hero"]);
+
+        // 5) 효과음·글꼴 기본 생성 검증
+        create_default_asset(assets, AssetKind::Sound, "beep").unwrap();
+        create_default_asset(assets, AssetKind::Font, "digits").unwrap();
+        assert_eq!(list_sound_names(assets), vec!["beep"]);
+        assert_eq!(list_font_names(assets), vec!["digits"]);
+    }
+
+    // 알 수 없는 파일만 "기타" 목록에 수집되는지 검증
+    #[test]
+    fn list_other_files_finds_unknown_assets() {
+        let dir = tempfile::tempdir().unwrap();
+        let assets = dir.path();
+        create_default_asset(assets, AssetKind::Sprite, "hero").unwrap();
+        fs::write(assets.join("icon.png"), b"").unwrap();
+        fs::write(assets.join("notes.txt"), b"memo").unwrap();
+        fs::write(assets.join("sprites").join("readme.md"), b"doc").unwrap();
+
+        let others = list_other_files(assets);
+        assert_eq!(others, vec!["notes.txt", "sprites/readme.md"]);
     }
 }

@@ -12,9 +12,10 @@ mod workspace; // 프로젝트 열기·생성·설정 저장·doctor 실행 모�
 
 // 명령 객체, 이력 관리자, 캔버스 스냅샷 헬퍼 불러오기
 use asset_io::{
-    FontAssetFile, has_icon_png, list_font_names, list_sound_names, list_sprite_names,
-    load_font_toml, load_sound_toml, load_sprite_png, save_font_toml, save_sound_toml,
-    save_sprite_png, validate_asset_name,
+    AssetKind, FontAssetFile, create_default_asset, delete_asset, duplicate_asset, has_icon_png,
+    list_font_names, list_other_files, list_sound_names, list_sprite_names, load_font_toml,
+    load_sound_toml, load_sprite_png, open_in_file_explorer, rename_asset, save_font_toml,
+    save_sound_toml, save_sprite_png, validate_asset_name,
 };
 use command::{CommandHistory, ReplaceCanvasCommand, ReplaceMelodyCommand, snapshot_canvas};
 use device::{
@@ -66,6 +67,33 @@ enum PendingConfirm {
     Tab(TabKind), // 미저장 탭 하나 닫기 확인
     Project,      // 미저장 탭이 있는 상태에서 프로젝트 닫기 확인
     App,          // 미저장 탭이 있는 상태에서 앱 창 종료 확인
+}
+
+// 에셋 탐색기 관리 팝업(새로 만들기 · 이름 바꾸기 · 복제 · 삭제 확인) 상태
+#[derive(Clone, PartialEq, Eq)]
+enum AssetModal {
+    Create {
+        kind: AssetKind,
+        name: String,
+        error: String,
+    },
+    Rename {
+        kind: AssetKind,
+        old_name: String,
+        new_name: String,
+        error: String,
+    },
+    Duplicate {
+        kind: AssetKind,
+        src_name: String,
+        dst_name: String,
+        error: String,
+    },
+    Delete {
+        kind: AssetKind,
+        name: String,
+        error: String,
+    },
 }
 
 // 프로젝트 설정 탭 전용 편집 폼 상태
@@ -241,8 +269,11 @@ struct StudioApp {
     sprite_files: Vec<String>,               // 탐색기에 표시할 assets/sprites/*.png 목록
     sound_files: Vec<String>,                // 탐색기에 표시할 assets/sounds/*.sound.toml 목록
     font_files: Vec<String>,                 // 탐색기에 표시할 assets/fonts/*.font.toml 목록
+    other_files: Vec<String>,                // 탐색기에 "기타"로 표시할 알 수 없는 파일 목록
     has_icon: bool,                          // assets/icon.png 파일 존재 여부
     editing_icon: bool, // true면 스프라이트 편집기가 assets/icon.png(16×16) 편집 모드
+    asset_modal: Option<AssetModal>, // 에셋 생성·이름변경·복제·삭제 모달 상태
+    explorer_status: String, // 에셋 관리 작업 결과 안내
 }
 
 impl StudioApp {
@@ -287,8 +318,11 @@ impl StudioApp {
             sprite_files: Vec::new(),
             sound_files: Vec::new(),
             font_files: Vec::new(),
+            other_files: Vec::new(),
             has_icon: false,
             editing_icon: false,
+            asset_modal: None,
+            explorer_status: String::new(),
         };
 
         // 실행 인자로 경로가 들어오면 시작하자마자 프로젝트 열기 시도
@@ -332,6 +366,8 @@ impl StudioApp {
                 self.editing_icon = false;
                 self.anim_playing = false;
                 self.anim_elapsed_ms = 0.0;
+                self.asset_modal = None;
+                self.explorer_status.clear();
                 self.pending_confirm = None;
                 self.start_screen.error_message = None;
                 // 프로젝트 열기 직후 환경 점검(doctor)을 백그라운드로 자동 시작
@@ -377,7 +413,10 @@ impl StudioApp {
         self.sprite_files.clear();
         self.sound_files.clear();
         self.font_files.clear();
+        self.other_files.clear();
         self.has_icon = false;
+        self.asset_modal = None;
+        self.explorer_status.clear();
         self.pending_confirm = None; // 확인 팝업 닫기
     }
 
@@ -441,19 +480,45 @@ impl StudioApp {
         }
     }
 
-    // 열린 프로젝트의 에셋 파일 목록(sprites, sounds, fonts, icon.png)을 다시 스캔
+    // 열린 프로젝트의 에셋 파일 목록(sprites, sounds, fonts, 기타, icon.png)을 다시 스캔
     fn refresh_asset_lists(&mut self) {
         let Some(assets_dir) = self.opened.as_ref().map(|o| o.project.assets_dir()) else {
             self.sprite_files.clear();
             self.sound_files.clear();
             self.font_files.clear();
+            self.other_files.clear();
             self.has_icon = false;
             return;
         };
         self.sprite_files = list_sprite_names(&assets_dir);
         self.sound_files = list_sound_names(&assets_dir);
         self.font_files = list_font_names(&assets_dir);
+        self.other_files = list_other_files(&assets_dir);
         self.has_icon = has_icon_png(&assets_dir);
+    }
+
+    // 지정한 종류와 이름의 에셋을 불러와 해당 편집기 탭 열기
+    fn open_asset_by_kind(&mut self, kind: AssetKind, name: String) {
+        match kind {
+            AssetKind::Sprite => {
+                self.editing_icon = false;
+                self.anim_playing = false;
+                self.anim_elapsed_ms = 0.0;
+                self.sprite_asset_name = name;
+                self.load_current_sprite();
+                self.tabs.open(TabKind::SpriteEditor);
+            }
+            AssetKind::Sound => {
+                self.sound_tab.asset_name = name;
+                self.load_current_sound();
+                self.tabs.open(TabKind::SoundTool);
+            }
+            AssetKind::Font => {
+                self.font_tab.asset_name = name;
+                self.load_current_font();
+                self.tabs.open(TabKind::FontTool);
+            }
+        }
     }
 
     // 현재 스프라이트(또는 아이콘 모드면 assets/icon.png)를 PNG로 저장
@@ -873,6 +938,235 @@ impl StudioApp {
             });
     }
 
+    // 에셋 탐색기 관리 모달 창 렌더링 (새로 만들기 · 이름 바꾸기 · 복제 · 삭제 확인)
+    fn show_asset_modal(&mut self, ctx: &egui::Context) {
+        let Some(mut modal) = self.asset_modal.take() else {
+            return;
+        };
+        let Some(assets_dir) = self.opened.as_ref().map(|o| o.project.assets_dir()) else {
+            return;
+        };
+
+        let mut keep_open = true;
+        let mut open_after: Option<(AssetKind, String)> = None;
+
+        match &mut modal {
+            AssetModal::Create { kind, name, error } => {
+                egui::Window::new("새 에셋 만들기")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                    .show(ctx, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("종류:");
+                            for candidate in [AssetKind::Sprite, AssetKind::Sound, AssetKind::Font]
+                            {
+                                ui.selectable_value(kind, candidate, candidate.label());
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("이름:");
+                            ui.add(
+                                egui::TextEdit::singleline(name)
+                                    .hint_text("예: player_run")
+                                    .desired_width(180.0),
+                            );
+                        });
+                        let trimmed = name.trim();
+                        let validation = validate_asset_name(trimmed);
+                        if let Err(msg) = &validation {
+                            ui.colored_label(egui::Color32::from_rgb(240, 200, 80), msg);
+                        }
+                        if !error.is_empty() {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(240, 100, 100),
+                                error.as_str(),
+                            );
+                        }
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(validation.is_ok(), egui::Button::new("만들기"))
+                                .clicked()
+                            {
+                                match create_default_asset(&assets_dir, *kind, trimmed) {
+                                    Ok(_) => {
+                                        self.explorer_status = format!("생성 완료: {trimmed}");
+                                        open_after = Some((*kind, trimmed.to_string()));
+                                        keep_open = false;
+                                    }
+                                    Err(err) => *error = err,
+                                }
+                            }
+                            if ui.button("취소").clicked() {
+                                keep_open = false;
+                            }
+                        });
+                    });
+            }
+            AssetModal::Rename {
+                kind,
+                old_name,
+                new_name,
+                error,
+            } => {
+                egui::Window::new("에셋 이름 바꾸기")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                    .show(ctx, |ui| {
+                        ui.label(format!("대상: {} ({old_name})", kind.label()));
+                        ui.horizontal(|ui| {
+                            ui.label("새 이름:");
+                            ui.add(egui::TextEdit::singleline(new_name).desired_width(180.0));
+                        });
+                        let trimmed = new_name.trim();
+                        let validation = validate_asset_name(trimmed);
+                        if let Err(msg) = &validation {
+                            ui.colored_label(egui::Color32::from_rgb(240, 200, 80), msg);
+                        }
+                        if !error.is_empty() {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(240, 100, 100),
+                                error.as_str(),
+                            );
+                        }
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(validation.is_ok(), egui::Button::new("변경"))
+                                .clicked()
+                            {
+                                match rename_asset(&assets_dir, *kind, old_name, trimmed) {
+                                    Ok(_) => {
+                                        // 현재 편집 중인 에셋 이름도 함께 갱신
+                                        match *kind {
+                                            AssetKind::Sprite
+                                                if self.sprite_asset_name == *old_name =>
+                                            {
+                                                self.sprite_asset_name = trimmed.to_string();
+                                            }
+                                            AssetKind::Sound
+                                                if self.sound_tab.asset_name == *old_name =>
+                                            {
+                                                self.sound_tab.asset_name = trimmed.to_string();
+                                            }
+                                            AssetKind::Font
+                                                if self.font_tab.asset_name == *old_name =>
+                                            {
+                                                self.font_tab.asset_name = trimmed.to_string();
+                                            }
+                                            _ => {}
+                                        }
+                                        self.explorer_status =
+                                            format!("이름 변경: {old_name} → {trimmed}");
+                                        keep_open = false;
+                                    }
+                                    Err(err) => *error = err,
+                                }
+                            }
+                            if ui.button("취소").clicked() {
+                                keep_open = false;
+                            }
+                        });
+                    });
+            }
+            AssetModal::Duplicate {
+                kind,
+                src_name,
+                dst_name,
+                error,
+            } => {
+                egui::Window::new("에셋 복제")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                    .show(ctx, |ui| {
+                        ui.label(format!("원본: {} ({src_name})", kind.label()));
+                        ui.horizontal(|ui| {
+                            ui.label("복제 이름:");
+                            ui.add(egui::TextEdit::singleline(dst_name).desired_width(180.0));
+                        });
+                        let trimmed = dst_name.trim();
+                        let validation = validate_asset_name(trimmed);
+                        if let Err(msg) = &validation {
+                            ui.colored_label(egui::Color32::from_rgb(240, 200, 80), msg);
+                        }
+                        if !error.is_empty() {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(240, 100, 100),
+                                error.as_str(),
+                            );
+                        }
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(validation.is_ok(), egui::Button::new("복제"))
+                                .clicked()
+                            {
+                                match duplicate_asset(&assets_dir, *kind, src_name, trimmed) {
+                                    Ok(_) => {
+                                        self.explorer_status =
+                                            format!("복제 완료: {src_name} → {trimmed}");
+                                        open_after = Some((*kind, trimmed.to_string()));
+                                        keep_open = false;
+                                    }
+                                    Err(err) => *error = err,
+                                }
+                            }
+                            if ui.button("취소").clicked() {
+                                keep_open = false;
+                            }
+                        });
+                    });
+            }
+            AssetModal::Delete { kind, name, error } => {
+                egui::Window::new("에셋 삭제 확인")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                    .show(ctx, |ui| {
+                        ui.label(format!(
+                            "'{}' ({}) 파일을 삭제할까요?
+삭제한 파일은 되돌릴 수 없습니다.",
+                            name,
+                            kind.label()
+                        ));
+                        if !error.is_empty() {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(240, 100, 100),
+                                error.as_str(),
+                            );
+                        }
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("삭제").clicked() {
+                                match delete_asset(&assets_dir, *kind, name) {
+                                    Ok(()) => {
+                                        self.explorer_status = format!("삭제 완료: {name}");
+                                        keep_open = false;
+                                    }
+                                    Err(err) => *error = err,
+                                }
+                            }
+                            if ui.button("취소").clicked() {
+                                keep_open = false;
+                            }
+                        });
+                    });
+            }
+        }
+
+        if keep_open {
+            self.asset_modal = Some(modal);
+        } else {
+            self.refresh_asset_lists();
+            if let Some((kind, name)) = open_after {
+                self.open_asset_by_kind(kind, name);
+            }
+        }
+    }
+
     // 중앙 작업 공간 상단의 파일 단위 탭 바 렌더링 ([개요] [효과음 편집기 ● ×] ...)
     fn show_editor_tab_bar(&mut self, ui: &mut egui::Ui) {
         let open_tabs = self.tabs.open_tabs().to_vec(); // 순회 중 변경 충돌 방지 복사본
@@ -1245,7 +1539,29 @@ impl StudioApp {
 
         ui.add_space(8.0);
         ui.horizontal(|ui| {
-            ui.label("에셋");
+            ui.strong("에셋");
+            if ui
+                .small_button("+")
+                .on_hover_text("새 에셋 만들기")
+                .clicked()
+            {
+                self.asset_modal = Some(AssetModal::Create {
+                    kind: AssetKind::Sprite,
+                    name: String::new(),
+                    error: String::new(),
+                });
+            }
+            if ui
+                .small_button("📂")
+                .on_hover_text("OS 탐색기에서 assets/ 폴더 열기")
+                .clicked()
+                && let Some(assets_dir) = self.opened.as_ref().map(|o| o.project.assets_dir())
+            {
+                match open_in_file_explorer(&assets_dir) {
+                    Ok(()) => self.explorer_status.clear(),
+                    Err(err) => self.explorer_status = err,
+                }
+            }
             if ui
                 .small_button("↻")
                 .on_hover_text("에셋 목록 새로고침")
@@ -1254,14 +1570,17 @@ impl StudioApp {
                 self.refresh_asset_lists();
             }
         });
+        ui.colored_label(
+            egui::Color32::from_gray(125),
+            "항목 우클릭: 이름변경·복제·삭제",
+        );
 
-        // 클릭한 에셋을 루프 종료 후 바로 열기 위한 임시 변수
-        let mut open_sprite: Option<String> = None;
-        let mut open_sound: Option<String> = None;
-        let mut open_font: Option<String> = None;
+        // 클릭 및 우클릭 메뉴 동작을 루프 종료 후 반영하기 위한 임시 변수
+        let mut open_target: Option<(AssetKind, String)> = None;
+        let mut next_modal: Option<AssetModal> = None;
         let mut open_icon = false;
 
-        // 1) sprites/ 목록 (클릭 시 스프라이트 탭으로 바로 불러오기)
+        // 1) sprites/ 목록
         egui::CollapsingHeader::new("sprites/")
             .default_open(true)
             .show(ui, |ui| {
@@ -1272,17 +1591,43 @@ impl StudioApp {
                         let selected = active == TabKind::SpriteEditor
                             && !self.editing_icon
                             && self.sprite_asset_name == *name;
-                        if ui
-                            .selectable_label(selected, format!("{name}.png"))
-                            .clicked()
-                        {
-                            open_sprite = Some(name.clone());
+                        let resp = ui.selectable_label(selected, format!("{name}.png"));
+                        if resp.clicked() {
+                            open_target = Some((AssetKind::Sprite, name.clone()));
                         }
+                        resp.context_menu(|ui| {
+                            if ui.button("이름 바꾸기").clicked() {
+                                next_modal = Some(AssetModal::Rename {
+                                    kind: AssetKind::Sprite,
+                                    old_name: name.clone(),
+                                    new_name: name.clone(),
+                                    error: String::new(),
+                                });
+                                ui.close();
+                            }
+                            if ui.button("복제").clicked() {
+                                next_modal = Some(AssetModal::Duplicate {
+                                    kind: AssetKind::Sprite,
+                                    src_name: name.clone(),
+                                    dst_name: format!("{name}_copy"),
+                                    error: String::new(),
+                                });
+                                ui.close();
+                            }
+                            if ui.button("삭제").clicked() {
+                                next_modal = Some(AssetModal::Delete {
+                                    kind: AssetKind::Sprite,
+                                    name: name.clone(),
+                                    error: String::new(),
+                                });
+                                ui.close();
+                            }
+                        });
                     }
                 }
             });
 
-        // 2) sounds/ 목록 (클릭 시 효과음 탭으로 바로 불러오기)
+        // 2) sounds/ 목록
         egui::CollapsingHeader::new("sounds/")
             .default_open(true)
             .show(ui, |ui| {
@@ -1292,17 +1637,43 @@ impl StudioApp {
                     for name in &self.sound_files {
                         let selected =
                             active == TabKind::SoundTool && self.sound_tab.asset_name == *name;
-                        if ui
-                            .selectable_label(selected, format!("{name}.sound.toml"))
-                            .clicked()
-                        {
-                            open_sound = Some(name.clone());
+                        let resp = ui.selectable_label(selected, format!("{name}.sound.toml"));
+                        if resp.clicked() {
+                            open_target = Some((AssetKind::Sound, name.clone()));
                         }
+                        resp.context_menu(|ui| {
+                            if ui.button("이름 바꾸기").clicked() {
+                                next_modal = Some(AssetModal::Rename {
+                                    kind: AssetKind::Sound,
+                                    old_name: name.clone(),
+                                    new_name: name.clone(),
+                                    error: String::new(),
+                                });
+                                ui.close();
+                            }
+                            if ui.button("복제").clicked() {
+                                next_modal = Some(AssetModal::Duplicate {
+                                    kind: AssetKind::Sound,
+                                    src_name: name.clone(),
+                                    dst_name: format!("{name}_copy"),
+                                    error: String::new(),
+                                });
+                                ui.close();
+                            }
+                            if ui.button("삭제").clicked() {
+                                next_modal = Some(AssetModal::Delete {
+                                    kind: AssetKind::Sound,
+                                    name: name.clone(),
+                                    error: String::new(),
+                                });
+                                ui.close();
+                            }
+                        });
                     }
                 }
             });
 
-        // 3) fonts/ 목록 (클릭 시 글꼴 탭으로 바로 불러오기)
+        // 3) fonts/ 목록
         egui::CollapsingHeader::new("fonts/")
             .default_open(true)
             .show(ui, |ui| {
@@ -1312,12 +1683,38 @@ impl StudioApp {
                     for name in &self.font_files {
                         let selected =
                             active == TabKind::FontTool && self.font_tab.asset_name == *name;
-                        if ui
-                            .selectable_label(selected, format!("{name}.font.toml"))
-                            .clicked()
-                        {
-                            open_font = Some(name.clone());
+                        let resp = ui.selectable_label(selected, format!("{name}.font.toml"));
+                        if resp.clicked() {
+                            open_target = Some((AssetKind::Font, name.clone()));
                         }
+                        resp.context_menu(|ui| {
+                            if ui.button("이름 바꾸기").clicked() {
+                                next_modal = Some(AssetModal::Rename {
+                                    kind: AssetKind::Font,
+                                    old_name: name.clone(),
+                                    new_name: name.clone(),
+                                    error: String::new(),
+                                });
+                                ui.close();
+                            }
+                            if ui.button("복제").clicked() {
+                                next_modal = Some(AssetModal::Duplicate {
+                                    kind: AssetKind::Font,
+                                    src_name: name.clone(),
+                                    dst_name: format!("{name}_copy"),
+                                    error: String::new(),
+                                });
+                                ui.close();
+                            }
+                            if ui.button("삭제").clicked() {
+                                next_modal = Some(AssetModal::Delete {
+                                    kind: AssetKind::Font,
+                                    name: name.clone(),
+                                    error: String::new(),
+                                });
+                                ui.close();
+                            }
+                        });
                     }
                 }
             });
@@ -1333,24 +1730,28 @@ impl StudioApp {
             open_icon = true;
         }
 
+        // 5) 기타 (알 수 없는 형식의 파일은 표시만 하고 무시)
+        if !self.other_files.is_empty() {
+            egui::CollapsingHeader::new(format!("기타 ({})", self.other_files.len()))
+                .default_open(false)
+                .show(ui, |ui| {
+                    for item in &self.other_files {
+                        ui.colored_label(egui::Color32::from_gray(130), format!("  {item}"));
+                    }
+                });
+        }
+
+        if !self.explorer_status.is_empty() {
+            ui.add_space(4.0);
+            ui.colored_label(egui::Color32::from_rgb(240, 200, 80), &self.explorer_status);
+        }
+
         // 클릭된 에셋 파일 즉시 불러오기 및 해당 편집기 탭 활성화
-        if let Some(name) = open_sprite {
-            self.editing_icon = false;
-            self.anim_playing = false;
-            self.anim_elapsed_ms = 0.0;
-            self.sprite_asset_name = name;
-            self.load_current_sprite();
-            self.tabs.open(TabKind::SpriteEditor);
+        if let Some((kind, name)) = open_target {
+            self.open_asset_by_kind(kind, name);
         }
-        if let Some(name) = open_sound {
-            self.sound_tab.asset_name = name;
-            self.load_current_sound();
-            self.tabs.open(TabKind::SoundTool);
-        }
-        if let Some(name) = open_font {
-            self.font_tab.asset_name = name;
-            self.load_current_font();
-            self.tabs.open(TabKind::FontTool);
+        if let Some(modal) = next_modal {
+            self.asset_modal = Some(modal);
         }
         if open_icon {
             self.open_icon_png();
@@ -3043,8 +3444,9 @@ impl eframe::App for StudioApp {
             }
         });
 
-        // 5) 미저장 변경 사항 닫기 확인 모달 표시 (필요 시)
+        // 5) 미저장 변경 사항 닫기 확인 및 에셋 관리 모달 표시 (필요 시)
         self.show_confirm_dialog(ui.ctx());
+        self.show_asset_modal(ui.ctx());
     }
 }
 
