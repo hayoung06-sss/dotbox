@@ -64,3 +64,5 @@
   - 개요 탭(`dotbox.toml`·`doctor` 점검·포트/플래시 상태)
   - 프로젝트 설정 탭(`[paths]`·좌/우 포트 저장) 및 하단 출력·문제 패널 추가
 - `dotbox-studio`: GUI 독립 편집 명령 객체(`CommandHistory`) 기반 실행 취소/다시 실행(`Ctrl+Z`/`Ctrl+Y`)을 스프라이트·효과음 편집기에 적용하고, 파일 단위 탭 바·미저장(`●`) 표시·닫기 확인 팝업 추가
+- `dotbox-studio`: 1장 잔재 정리(실시간 CLI 스트리밍 및 [■ 중지], 기기 패널 경로 고정, 전역 밝기 분리)
+- `dotbox-studio`: 에셋 탐색기 기반 스프라이트(.png)·효과음(.sound.toml)·글꼴(.font.toml)·아이콘(icon.png) 즉시 열기 및 저장(Ctrl+S) 지원

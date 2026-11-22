@@ -76,11 +76,6 @@ impl CanvasEditor {
         self.led_preview = enabled;
     }
 
-    // 현재 설정된 실기기 밝기 비율(%) 반환
-    pub fn brightness_percent(&self) -> u8 {
-        self.brightness_percent
-    }
-
     // 밝기 값을 실기기 범위(15~25%) 안으로 제한해 저장
     pub fn set_brightness_percent(&mut self, percent: u8) {
         self.brightness_percent = percent.clamp(15, 25);

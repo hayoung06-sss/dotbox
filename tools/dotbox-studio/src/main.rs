@@ -1,3 +1,4 @@
+mod asset_io;
 mod command; // GUI 독립 편집 명령 객체 및 실행 취소/다시 실행 모듈
 mod device; // 4순위: 환경 점검·포트 감지·플래시 로직 모듈
 mod editor; // 1순위: 스프라이트·화면 편집 로직 모듈
@@ -5,13 +6,20 @@ mod font; // 2순위: 글꼴 변환·미리보기 로직 모듈
 mod settings; // 사용자 전역 설정 (최근 프로젝트, 창 크기, 밝기)
 mod sound; // 3순위: 효과음·멜로디 편집 및 재생 로직 모듈
 mod tabs; // 파일 단위 탭 및 더티(●) 상태 관리 모듈
-mod workspace; // 프로젝트 열기·생성·설정 저장·doctor 실행 모듈
+mod workspace; // 프로젝트 열기·생성·설정 저장·doctor 실행 모듈 // 스프라이트(.png) · 효과음(.sound.toml) 파일 저장/불러오기 모듈
 
 // 명령 객체, 이력 관리자, 캔버스 스냅샷 헬퍼 불러오기
-use command::{CommandHistory, ReplaceCanvasCommand, ReplaceMelodyCommand, snapshot_canvas};
+use asset_io::{
+    FontAssetFile, has_icon_png, list_font_names, list_sound_names, list_sprite_names,
+    load_font_toml, load_sound_toml, load_sprite_png, save_font_toml, save_sound_toml,
+    save_sprite_png, validate_asset_name,
+};
+use command::{
+    CommandHistory, ReplaceCanvasCommand, ReplaceMelodyCommand, restore_canvas, snapshot_canvas,
+};
 use device::{
-    DetectedPort, FlashTarget, build_doctor_args, build_flash_args, build_run_args,
-    run_command_async, scan_serial_ports,
+    DetectedPort, FlashTarget, RunningCommand, build_flash_args, build_run_args, format_command,
+    scan_serial_ports, spawn_command_streaming,
 };
 use dotbox_core::display::{FrameBuffer, PANEL_WIDTH, ScreenLayout};
 use dotbox_core::hal::Rgb;
@@ -40,8 +48,9 @@ enum BottomTab {
 // 저장하지 않은 변경 사항이 있을 때 사용자 확인을 기다리는 대기 동작
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PendingConfirm {
-    CloseTab(TabKind), // 미저장 탭 하나 닫기 확인
-    CloseProject,      // 미저장 탭이 있는 상태에서 프로젝트 닫기 확인
+    Tab(TabKind), // 미저장 탭 하나 닫기 확인
+    Project,      // 미저장 탭이 있는 상태에서 프로젝트 닫기 확인
+    App,          // 미저장 탭이 있는 상태에서 앱 창 종료 확인
 }
 
 // 프로젝트 설정 탭 전용 편집 폼 상태
@@ -76,20 +85,25 @@ impl ProjectSettingsForm {
 struct FontTabState {
     font_path: String,                // 불러올 TTF/OTF 파일 경로
     config: FontConfig,               // 픽셀 크기, 임계값, 문자 집합 설정
+    license: String,                  // 글꼴 라이선스 정보
     preview_text: String,             // 32×16 화면에 미리 볼 문구
     converter: Option<FontConverter>, // 불러온 폰트 변환기 (불러오기 전엔 None)
-    status_message: String,           // 성공/오류 안내 메시지 (패닉 방지)
+    status_message: String,           // 폰트 불러오기 안내 메시지
+    asset_name: String,               // 저장·불러올 글꼴 이름 (fonts/<이름>.font.toml)
+    io_status: String,                // .font.toml 저장/불러오기 결과 안내
 }
 
 impl Default for FontTabState {
-    // Windows 기본 맑은 고딕 폰트 경로로 초기 상태 설정
     fn default() -> Self {
         Self {
             font_path: r"C:\Windows\Fonts\malgun.ttf".to_string(),
             config: FontConfig::default(),
+            license: String::new(),
             preview_text: "DotBox".to_string(),
             converter: None,
             status_message: "TTF/OTF 경로를 입력하고 [폰트 불러오기]를 누르세요.".to_string(),
+            asset_name: "main".to_string(),
+            io_status: String::new(),
         }
     }
 }
@@ -100,6 +114,8 @@ struct SoundTabState {
     history: CommandHistory<MelodyEditor>, // 파일별 독립 Undo/Redo 이력
     new_freq_hz: u16,                      // 새로 추가할 음표의 주파수 (Hz)
     new_duration_ms: u16,                  // 새로 추가할 음표의 길이 (ms)
+    asset_name: String,                    // 저장·불러올 효과음 이름 (sounds/<이름>.sound.toml)
+    status_message: String,                // 저장/불러오기 결과 안내
 }
 
 impl Default for SoundTabState {
@@ -110,6 +126,8 @@ impl Default for SoundTabState {
             history: CommandHistory::new(),
             new_freq_hz: 523,
             new_duration_ms: 150,
+            asset_name: "jump".to_string(),
+            status_message: String::new(),
         }
     }
 }
@@ -135,33 +153,27 @@ impl SoundTabState {
     }
 }
 
-// 기기 패널 탭 전용 UI 상태
+// 기기 패널 탭 전용 UI 상태 (프로젝트 경로는 열린 프로젝트 루트를 자동 사용)
 struct DeviceTabState {
-    dotbox_bin: String,                   // 실행할 dotbox CLI 경로 또는 명령 이름
-    project_dir: String,                  // 명령을 실행할 DotBox 게임 프로젝트 경로
-    ports: Vec<DetectedPort>,             // 마지막으로 스캔한 시리얼 포트 목록
-    port_status: String,                  // 포트 스캔 상태 메시지
-    selected_target: FlashTarget,         // 플래시 대상 (좌측 / 우측 / 양쪽)
-    selected_port: String,                // 플래시 시 지정할 시리얼 포트 (비우면 자동)
-    pending_rx: Option<Receiver<String>>, // 백그라운드 명령 결과 수신기
-    output_log: String,                   // CLI 실행 로그 출력 내용
+    dotbox_bin: String,                  // 실행할 dotbox CLI 경로 또는 명령 이름
+    ports: Vec<DetectedPort>,            // 마지막으로 스캔한 시리얼 포트 목록
+    port_status: String,                 // 포트 스캔 상태 메시지
+    selected_target: FlashTarget,        // 플래시 대상 (좌측 / 우측 / 양쪽)
+    selected_port: String,               // 플래시 시 지정할 시리얼 포트 (비우면 자동)
+    running_cmd: Option<RunningCommand>, // 백그라운드 실행 중인 CLI 프로세스 핸들
+    output_log: String,                  // 줄 단위로 누적되는 CLI 실행 출력 로그
 }
 
 impl Default for DeviceTabState {
-    // 현재 작업 디렉터리를 기본 프로젝트 경로로 설정
+    // 기본 CLI 명령 이름과 안내 문구로 초기화
     fn default() -> Self {
-        let cwd = std::env::current_dir()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| ".".to_string());
-
         Self {
             dotbox_bin: "dotbox".to_string(),
-            project_dir: cwd,
             ports: Vec::new(),
             port_status: "[시리얼 포트 새로고침]을 눌러 연결된 기기를 확인하세요.".to_string(),
             selected_target: FlashTarget::Left,
             selected_port: String::new(),
-            pending_rx: None,
+            running_cmd: None,
             output_log: "실행 로그가 여기에 표시됩니다.".to_string(),
         }
     }
@@ -187,7 +199,8 @@ struct StudioApp {
     doctor_rx: Option<Receiver<Report>>, // 백그라운드 doctor 실행 수신기
     doctor_host_only: bool,         // 시뮬레이터 전용 점검 옵션 여부
     tabs: TabManager,               // 파일 단위 중앙 탭 관리자
-    pending_confirm: Option<PendingConfirm>, // 미저장 탭/프로젝트 닫기 확인 팝업 상태
+    pending_confirm: Option<PendingConfirm>, // 미저장 탭/프로젝트/앱 닫기 확인 팝업 상태
+    allow_app_close: bool,          // 확인 팝업에서 앱 종료를 승인했는지 여부
     bottom_tab: BottomTab,          // 현재 열려 있는 하단 패널 탭
     show_bottom_panel: bool,        // 하단 패널 펼침 여부
     editor: CanvasEditor,           // 스프라이트·화면 편집기 상태
@@ -196,6 +209,13 @@ struct StudioApp {
     font_tab: FontTabState,         // 글꼴 변환기 상태
     sound_tab: SoundTabState,       // 효과음·멜로디 편집기 상태 (Undo/Redo 포함)
     device_tab: DeviceTabState,     // 기기 패널 상태
+    sprite_asset_name: String,      // 저장·불러올 스프라이트 이름 (sprites/<이름>.png)
+    sprite_io_status: String,       // 저장/불러오기 결과 안내
+    sprite_files: Vec<String>,      // 탐색기에 표시할 assets/sprites/*.png 목록
+    sound_files: Vec<String>,       // 탐색기에 표시할 assets/sounds/*.sound.toml 목록
+    font_files: Vec<String>,        // 탐색기에 표시할 assets/fonts/*.font.toml 목록
+    has_icon: bool,                 // assets/icon.png 파일 존재 여부
+    editing_icon: bool,             // true면 스프라이트 편집기가 assets/icon.png(16×16) 편집 모드
 }
 
 impl StudioApp {
@@ -216,6 +236,7 @@ impl StudioApp {
             doctor_host_only: false,
             tabs: TabManager::new(), // [개요] 탭 기본 열림
             pending_confirm: None,
+            allow_app_close: false, // 기본값: 미저장 탭이 있으면 종료 차단
             bottom_tab: BottomTab::Output,
             show_bottom_panel: true, // 하단 패널 기본 표시
             editor,
@@ -224,6 +245,13 @@ impl StudioApp {
             font_tab: FontTabState::default(),
             sound_tab: SoundTabState::default(),
             device_tab: DeviceTabState::default(),
+            sprite_asset_name: "player".to_string(),
+            sprite_io_status: String::new(),
+            sprite_files: Vec::new(),
+            sound_files: Vec::new(),
+            font_files: Vec::new(),
+            has_icon: false,
+            editing_icon: false,
         };
 
         // 실행 인자로 경로가 들어오면 시작하자마자 프로젝트 열기 시도
@@ -239,8 +267,13 @@ impl StudioApp {
         match OpenedProject::open(dir) {
             Ok(opened) => {
                 let root = opened.project.root().to_path_buf(); // 프로젝트 루트 절대 경로
-                // 기기 패널의 프로젝트 경로 및 왼쪽 포트 동기화
-                self.device_tab.project_dir = root.display().to_string();
+                // 이전 프로젝트에서 실행 중이던 CLI가 있으면 중지
+                if let Some(mut cmd) = self.device_tab.running_cmd.take() {
+                    cmd.stop();
+                }
+                // 기기 패널의 기본 왼쪽 포트 동기화
+                self.device_tab.selected_port =
+                    opened.local_config.ports.left.clone().unwrap_or_default();
                 self.device_tab.selected_port =
                     opened.local_config.ports.left.clone().unwrap_or_default();
                 // 프로젝트 설정 폼 동기화
@@ -250,6 +283,7 @@ impl StudioApp {
                 let _ = self.settings.save();
                 // 새 프로젝트를 열 때 탭·편집 이력 초기화 후 [개요] 탭 활성화
                 self.opened = Some(opened);
+                self.refresh_asset_lists();
                 self.tabs = TabManager::new();
                 self.sound_tab.history.reset();
                 self.canvas_history.reset(); // 스프라이트 편집 이력 초기화
@@ -270,7 +304,7 @@ impl StudioApp {
     // 프로젝트 닫기 요청: 저장하지 않은 탭이 있으면 확인 팝업을 먼저 표시
     fn request_close_project(&mut self) {
         if self.tabs.has_any_dirty(|kind| self.is_tab_dirty(kind)) {
-            self.pending_confirm = Some(PendingConfirm::CloseProject); // 확인 팝업 띄우기
+            self.pending_confirm = Some(PendingConfirm::Project); // 확인 팝업 띄우기
         } else {
             self.force_close_project(); // 미저장 변경이 없으면 바로 닫기
         }
@@ -278,6 +312,10 @@ impl StudioApp {
 
     // 확인 없이 즉시 프로젝트를 닫고 시작 화면으로 복귀
     fn force_close_project(&mut self) {
+        // 프로젝트 닫기 시 실행 중인 시뮬레이터·빌드 프로세스 정리
+        if let Some(mut cmd) = self.device_tab.running_cmd.take() {
+            cmd.stop();
+        }
         self.opened = None; // 열린 프로젝트 비우기
         self.doctor_report = None; // doctor 결과 정리
         self.doctor_rx = None; // doctor 수신기 정리
@@ -294,7 +332,7 @@ impl StudioApp {
             return; // 개요 탭은 닫기 불가
         }
         if self.is_tab_dirty(kind) {
-            self.pending_confirm = Some(PendingConfirm::CloseTab(kind)); // 확인 팝업 띄우기
+            self.pending_confirm = Some(PendingConfirm::Tab(kind)); // 확인 팝업 띄우기
         } else {
             self.tabs.close(kind); // 변경 없으면 바로 닫기
         }
@@ -309,19 +347,302 @@ impl StudioApp {
         }
     }
 
-    // 전역 키보드 단축키(Ctrl+Z 실행 취소, Ctrl+Y / Ctrl+Shift+Z 다시 실행) 처리
+    // 현재 OS 창 크기를 읽어 사용자 설정(studio.toml)에 저장
+    fn save_window_size(&mut self, ctx: &egui::Context) {
+        if let Some(rect) = ctx.input(|i| i.viewport().inner_rect) {
+            self.settings
+                .update_window_size(rect.width(), rect.height()); // 최소 크기 보정 후 반영
+            let _ = self.settings.save(); // studio.toml 파일로 저장
+        }
+    }
+
+    // OS 창 닫기(X) 버튼 클릭 시 미저장 탭 확인 및 마지막 창 크기 저장 처리
+    fn handle_window_close(&mut self, ctx: &egui::Context) {
+        // 창 닫기 요청이 없는 일반 프레임이면 즉시 반환
+        if !ctx.input(|i| i.viewport().close_requested()) {
+            return;
+        }
+
+        // 확인 팝업에서 이미 종료를 승인한 경우 창 크기만 저장하고 종료 진행
+        if self.allow_app_close {
+            self.save_window_size(ctx);
+            return;
+        }
+
+        // 열린 프로젝트에 저장하지 않은 탭이 하나라도 있는지 검사
+        let has_dirty =
+            self.opened.is_some() && self.tabs.has_any_dirty(|kind| self.is_tab_dirty(kind));
+        if has_dirty {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose); // 즉시 종료 취소
+            self.pending_confirm = Some(PendingConfirm::App); // 종료 확인 팝업 표시
+        } else {
+            self.save_window_size(ctx); // 미저장 변경이 없으면 창 크기 저장 후 바로 종료
+        }
+    }
+
+    // 열린 프로젝트의 에셋 파일 목록(sprites, sounds, fonts, icon.png)을 다시 스캔
+    fn refresh_asset_lists(&mut self) {
+        let Some(assets_dir) = self.opened.as_ref().map(|o| o.project.assets_dir()) else {
+            self.sprite_files.clear();
+            self.sound_files.clear();
+            self.font_files.clear();
+            self.has_icon = false;
+            return;
+        };
+        self.sprite_files = list_sprite_names(&assets_dir);
+        self.sound_files = list_sound_names(&assets_dir);
+        self.font_files = list_font_names(&assets_dir);
+        self.has_icon = has_icon_png(&assets_dir);
+    }
+
+    // 현재 스프라이트(또는 아이콘 모드면 assets/icon.png)를 PNG로 저장
+    fn save_current_sprite(&mut self) {
+        let Some(assets_dir) = self.opened.as_ref().map(|o| o.project.assets_dir()) else {
+            return;
+        };
+
+        let path = if self.editing_icon {
+            assets_dir.join("icon.png") // 16×16 아이콘 고정 경로
+        } else {
+            let name = self.sprite_asset_name.trim().to_string();
+            if let Err(err) = validate_asset_name(&name) {
+                self.sprite_io_status = format!("오류: {err}");
+                return;
+            }
+            assets_dir.join("sprites").join(format!("{name}.png"))
+        };
+
+        let width = self.editor.width();
+        let height = self.editor.height();
+        let pixels = snapshot_canvas(&mut self.editor);
+
+        match save_sprite_png(&path, width, height, &pixels) {
+            Ok(()) => {
+                self.canvas_history.mark_saved(); // ● 더티 표시 해제
+                self.refresh_asset_lists();
+                self.sprite_io_status = format!("저장 완료: {}", path.display());
+            }
+            Err(err) => self.sprite_io_status = format!("오류: {err}"),
+        }
+    }
+
+    // assets/icon.png(16×16)를 열거나, 아직 없으면 16×16 빈 캔버스로 아이콘 편집 시작
+    fn open_icon_png(&mut self) {
+        let Some(assets_dir) = self.opened.as_ref().map(|o| o.project.assets_dir()) else {
+            return;
+        };
+        self.editing_icon = true;
+        let path = assets_dir.join("icon.png");
+
+        if path.is_file() {
+            match load_sprite_png(&path) {
+                Ok((16, 16, pixels)) => {
+                    self.editor.set_layout(ScreenLayout::Mirrored);
+                    restore_canvas(&mut self.editor, &pixels);
+                    self.canvas_history.reset();
+                    self.canvas_drag_before = None;
+                    self.sprite_io_status = format!("아이콘 불러오기 완료: {}", path.display());
+                }
+                Ok((w, h, _)) => {
+                    self.sprite_io_status =
+                        format!("오류: icon.png는 16×16 크기여야 합니다 ({w}×{h}).");
+                }
+                Err(err) => self.sprite_io_status = format!("오류: {err}"),
+            }
+        } else {
+            // 파일이 아직 없으면 16×16 빈 캔버스로 새로 생성 준비
+            self.editor.set_layout(ScreenLayout::Mirrored);
+            self.canvas_history.reset();
+            self.canvas_drag_before = None;
+            self.sprite_io_status =
+                "새 icon.png (16×16) 편집 중 — Ctrl+S로 저장하세요.".to_string();
+        }
+        self.tabs.open(TabKind::SpriteEditor);
+    }
+
+    // 현재 글꼴 설정을 <프로젝트>/assets/fonts/<이름>.font.toml 로 저장
+    fn save_current_font(&mut self) {
+        let Some(assets_dir) = self.opened.as_ref().map(|o| o.project.assets_dir()) else {
+            return;
+        };
+        let name = self.font_tab.asset_name.trim().to_string();
+        if let Err(err) = validate_asset_name(&name) {
+            self.font_tab.io_status = format!("오류: {err}");
+            return;
+        }
+
+        let path = assets_dir.join("fonts").join(format!("{name}.font.toml"));
+        let data = FontAssetFile {
+            source: self.font_tab.font_path.clone(),
+            pixel_size: self.font_tab.config.pixel_size,
+            threshold: self.font_tab.config.threshold,
+            charset: self.font_tab.config.charset.clone(),
+            license: self.font_tab.license.clone(),
+        };
+
+        match save_font_toml(&path, &data) {
+            Ok(()) => {
+                self.refresh_asset_lists();
+                self.font_tab.io_status = format!("저장 완료: {}", path.display());
+            }
+            Err(err) => self.font_tab.io_status = format!("오류: {err}"),
+        }
+    }
+
+    // <프로젝트>/assets/fonts/<이름>.font.toml 을 불러오고 원본 TTF/OTF도 자동 로드
+    fn load_current_font(&mut self) {
+        let Some(assets_dir) = self.opened.as_ref().map(|o| o.project.assets_dir()) else {
+            return;
+        };
+        let name = self.font_tab.asset_name.trim().to_string();
+        if let Err(err) = validate_asset_name(&name) {
+            self.font_tab.io_status = format!("오류: {err}");
+            return;
+        }
+
+        let path = assets_dir.join("fonts").join(format!("{name}.font.toml"));
+        match load_font_toml(&path) {
+            Ok(data) => {
+                self.font_tab.font_path = data.source;
+                self.font_tab.config.pixel_size = data.pixel_size;
+                self.font_tab.config.threshold = data.threshold;
+                self.font_tab.config.charset = data.charset;
+                self.font_tab.license = data.license;
+                self.font_tab.io_status = format!("불러오기 완료: {}", path.display());
+
+                // 설정에 적힌 원본 TTF/OTF 파일도 바로 불러와 미리보기 갱신
+                match FontConverter::from_file(Path::new(&self.font_tab.font_path)) {
+                    Ok(converter) => {
+                        self.font_tab.converter = Some(converter);
+                        self.font_tab.status_message = "폰트 불러오기 완료!".to_string();
+                    }
+                    Err(err) => {
+                        self.font_tab.converter = None;
+                        self.font_tab.status_message = err;
+                    }
+                }
+            }
+            Err(err) => self.font_tab.io_status = format!("오류: {err}"),
+        }
+    }
+
+    // <프로젝트>/assets/sprites/<이름>.png 를 불러와 캔버스에 반영
+    fn load_current_sprite(&mut self) {
+        let Some(assets_dir) = self.opened.as_ref().map(|o| o.project.assets_dir()) else {
+            return;
+        };
+        let name = self.sprite_asset_name.trim().to_string();
+        if let Err(err) = validate_asset_name(&name) {
+            self.sprite_io_status = format!("오류: {err}");
+            return;
+        }
+
+        let path = assets_dir.join("sprites").join(format!("{name}.png"));
+        match load_sprite_png(&path) {
+            Ok((32, 16, pixels)) => {
+                self.editor.set_layout(ScreenLayout::Wide);
+                restore_canvas(&mut self.editor, &pixels);
+                self.canvas_history.reset();
+                self.canvas_drag_before = None;
+                self.sprite_io_status = format!("불러오기 완료: {}", path.display());
+            }
+            Ok((16, 16, pixels)) => {
+                self.editor.set_layout(ScreenLayout::Mirrored);
+                restore_canvas(&mut self.editor, &pixels);
+                self.canvas_history.reset();
+                self.canvas_drag_before = None;
+                self.sprite_io_status = format!("불러오기 완료: {}", path.display());
+            }
+            Ok((w, h, _)) => {
+                self.sprite_io_status =
+                    format!("오류: 지원 크기(32×16, 16×16)가 아닙니다 ({w}×{h}).");
+            }
+            Err(err) => self.sprite_io_status = format!("오류: {err}"),
+        }
+    }
+
+    // 현재 효과음을 <프로젝트>/assets/sounds/<이름>.sound.toml 로 저장
+    fn save_current_sound(&mut self) {
+        let Some(assets_dir) = self.opened.as_ref().map(|o| o.project.assets_dir()) else {
+            return;
+        };
+        let name = self.sound_tab.asset_name.trim().to_string();
+        if let Err(err) = validate_asset_name(&name) {
+            self.sound_tab.status_message = format!("오류: {err}");
+            return;
+        }
+
+        let path = assets_dir.join("sounds").join(format!("{name}.sound.toml"));
+        match save_sound_toml(&path, self.sound_tab.melody.notes()) {
+            Ok(()) => {
+                self.sound_tab.history.mark_saved(); // ● 더티 표시 해제
+                self.refresh_asset_lists();
+                self.sound_tab.status_message = format!("저장 완료: {}", path.display());
+            }
+            Err(err) => self.sound_tab.status_message = format!("오류: {err}"),
+        }
+    }
+
+    // <프로젝트>/assets/sounds/<이름>.sound.toml 을 불러와 편집기에 반영
+    fn load_current_sound(&mut self) {
+        let Some(assets_dir) = self.opened.as_ref().map(|o| o.project.assets_dir()) else {
+            return;
+        };
+        let name = self.sound_tab.asset_name.trim().to_string();
+        if let Err(err) = validate_asset_name(&name) {
+            self.sound_tab.status_message = format!("오류: {err}");
+            return;
+        }
+
+        let path = assets_dir.join("sounds").join(format!("{name}.sound.toml"));
+        match load_sound_toml(&path) {
+            Ok(notes) => {
+                self.sound_tab.melody.clear();
+                for note in notes {
+                    self.sound_tab
+                        .melody
+                        .add_note(note.freq_hz, note.duration_ms);
+                }
+                self.sound_tab.history.reset();
+                self.sound_tab.status_message = format!("불러오기 완료: {}", path.display());
+            }
+            Err(err) => self.sound_tab.status_message = format!("오류: {err}"),
+        }
+    }
+
+    // 전역 키보드 단축키(Ctrl+Z 실행 취소, Ctrl+Y 다시 실행, Ctrl+W 현재 탭 닫기) 처리
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        // 텍스트 입력칸에 포커스가 있을 때는 텍스트 자체의 Ctrl+Z와 충돌하지 않도록 건너뜀
+        // Ctrl+S: 텍스트 입력칸 포커스 여부와 관계없이 현재 탭 즉시 저장
+        let want_save =
+            ctx.input(|i| i.modifiers.command && !i.modifiers.shift && i.key_pressed(egui::Key::S));
+        if want_save {
+            match self.tabs.active() {
+                TabKind::SpriteEditor => self.save_current_sprite(),
+                TabKind::SoundTool => self.save_current_sound(),
+                TabKind::FontTool => self.save_current_font(), // 글꼴 설정 저장
+                _ => {}
+            }
+            return;
+        }
+
+        // 텍스트 입력칸에 포커스가 있을 때는 텍스트 자체 단축키와 충돌하지 않도록 건너뜀
         if ctx.egui_wants_keyboard_input() {
             return;
         }
 
-        let (want_undo, want_redo) = ctx.input(|i| {
+        let (want_undo, want_redo, want_close_tab) = ctx.input(|i| {
             let undo = i.modifiers.command && !i.modifiers.shift && i.key_pressed(egui::Key::Z);
             let redo = (i.modifiers.command && i.key_pressed(egui::Key::Y))
                 || (i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::Z));
-            (undo, redo)
+            let close_tab = i.modifiers.command && i.key_pressed(egui::Key::W); // 현재 탭 닫기
+            (undo, redo, close_tab)
         });
+
+        // Ctrl+W 입력 시 현재 활성 탭 닫기 요청 (더티면 확인 팝업 표시)
+        if want_close_tab {
+            self.request_close_tab(self.tabs.active());
+            return;
+        }
 
         // 현재 활성 탭에 맞는 독립 이력에 Undo/Redo 적용
         match self.tabs.active() {
@@ -370,19 +691,26 @@ impl StudioApp {
             }
         }
 
-        // 2) 기기 패널 CLI 명령 결과 수신 확인
-        if let Some(rx) = &self.device_tab.pending_rx {
-            match rx.try_recv() {
-                Ok(log) => {
-                    self.device_tab.output_log = log; // 실행 로그 반영
-                    self.device_tab.pending_rx = None; // 수신기 정리
+        // 2) 실행 중인 CLI 프로세스의 줄 단위 출력 수신 및 종료 확인
+        if let Some(cmd) = &mut self.device_tab.running_cmd {
+            // 새로 도착한 출력 줄을 즉시 로그 끝에 추가
+            for line in cmd.poll_lines() {
+                self.device_tab.output_log.push_str(&line);
+                self.device_tab.output_log.push('\n');
+            }
+
+            // 프로세스가 끝났는지 확인
+            if let Some(status_line) = cmd.try_finish() {
+                // 종료 직전 파이프에 남은 마지막 줄까지 모두 비우기
+                for line in cmd.poll_lines() {
+                    self.device_tab.output_log.push_str(&line);
+                    self.device_tab.output_log.push('\n');
                 }
-                Err(TryRecvError::Empty) => {
-                    ctx.request_repaint(); // 실행 중이면 계속 화면 갱신 요청
-                }
-                Err(TryRecvError::Disconnected) => {
-                    self.device_tab.pending_rx = None; // 채널 끊김 시 정리
-                }
+                self.device_tab.output_log.push_str(&status_line);
+                self.device_tab.output_log.push('\n');
+                self.device_tab.running_cmd = None; // 실행 핸들 정리
+            } else {
+                ctx.request_repaint(); // 실행 중이면 계속 실시간 갱신 요청
             }
         }
     }
@@ -407,16 +735,24 @@ impl StudioApp {
             return; // 확인 대기 중인 동작이 없으면 표시 안 함
         };
 
-        let message = match pending {
-            PendingConfirm::CloseTab(kind) => {
+        // 대기 동작에 맞는 안내 문구와 확인 버튼 라벨 결정
+        let (message, confirm_label) = match pending {
+            PendingConfirm::Tab(kind) => (
                 format!(
                     "'{}' 탭에 저장하지 않은 변경 사항이 있습니다.\n변경 사항을 버리고 닫을까요?",
                     kind.title()
-                )
-            }
-            PendingConfirm::CloseProject => {
-                "저장하지 않은 탭이 있습니다.\n변경 사항을 버리고 프로젝트를 닫을까요?".to_string()
-            }
+                ),
+                "버리고 닫기",
+            ),
+            PendingConfirm::Project => (
+                "저장하지 않은 탭이 있습니다.\n변경 사항을 버리고 프로젝트를 닫을까요?".to_string(),
+                "버리고 닫기",
+            ),
+            PendingConfirm::App => (
+                "저장하지 않은 탭이 있습니다.\n변경 사항을 버리고 DotBox Studio를 종료할까요?"
+                    .to_string(),
+                "버리고 종료",
+            ),
         };
 
         // 화면 중앙에 고정된 확인 팝업 표시
@@ -428,27 +764,33 @@ impl StudioApp {
                 ui.label(message);
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
-                    if ui.button("버리고 닫기").clicked() {
+                    if ui.button(confirm_label).clicked() {
                         match pending {
-                            PendingConfirm::CloseTab(kind) => {
+                            PendingConfirm::Tab(kind) => {
                                 // 탭을 닫고 해당 편집기 이력 초기화
                                 if kind == TabKind::SoundTool {
                                     self.sound_tab.history.reset();
                                 }
                                 if kind == TabKind::SpriteEditor {
-                                    self.canvas_history.reset(); // 스프라이트 이력 초기화
+                                    self.canvas_history.reset();
                                     self.canvas_drag_before = None;
                                 }
                                 self.tabs.close(kind);
                                 self.pending_confirm = None;
                             }
-                            PendingConfirm::CloseProject => {
+                            PendingConfirm::Project => {
                                 self.force_close_project(); // 프로젝트 강제 닫기
+                            }
+                            PendingConfirm::App => {
+                                self.allow_app_close = true; // 다음 프레임 종료 허용
+                                self.pending_confirm = None; // 팝업 닫기
+                                self.save_window_size(ctx); // 마지막 창 크기 저장
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Close); // 앱 종료 실행
                             }
                         }
                     }
                     if ui.button("취소").clicked() {
-                        self.pending_confirm = None; // 닫기 취소
+                        self.pending_confirm = None; // 닫기·종료 취소
                     }
                 });
             });
@@ -709,7 +1051,7 @@ impl StudioApp {
     // 상단 작업 공간 도구 모음 (프로젝트 닫기 · 실행 · 전역 밝기 · 상태 요약)
     fn show_top_bar(&mut self, ui: &mut egui::Ui) -> bool {
         let mut want_close = false;
-        let is_cli_busy = self.device_tab.pending_rx.is_some(); // CLI 실행 중 여부
+        let is_cli_busy = self.device_tab.running_cmd.is_some(); // CLI 실행 중 여부
 
         // 상단 상태 표시용 프로젝트 이름·포트 문자열 추출
         let (project_name, left_port, right_port) = match &self.opened {
@@ -739,11 +1081,12 @@ impl StudioApp {
 
             ui.separator();
 
-            // 시뮬레이터 실행 버튼 (하단 출력 패널 자동 열기)
-            if ui
-                .add_enabled(!is_cli_busy, egui::Button::new("▶ 실행"))
-                .clicked()
-            {
+            // 시뮬레이터 실행 / 중지 버튼 (실행 중이면 [■ 중지] 표시)
+            if is_cli_busy {
+                if ui.button("■ 중지").clicked() {
+                    self.stop_cli_command(); // 실행 중인 자식 프로세스 종료
+                }
+            } else if ui.button("▶ 실행").clicked() {
                 self.show_bottom_panel = true;
                 self.bottom_tab = BottomTab::Output;
                 self.launch_cli_command(build_run_args());
@@ -760,23 +1103,25 @@ impl StudioApp {
 
             ui.separator();
 
-            // 전역 실기기 밝기 미리보기 설정 (명세서 4.5: 도구 모음에 전역 1개로 통일)
-            let mut preview = self.editor.led_preview();
-            if ui.checkbox(&mut preview, "실기기 밝기").changed() {
-                self.editor.set_led_preview(preview);
-                self.settings.led_preview = preview;
+            // 전역 실기기 밝기 미리보기 설정 (self.settings가 단일 진실 공급원)
+            if ui
+                .checkbox(&mut self.settings.led_preview, "실기기 밝기")
+                .changed()
+            {
+                self.editor.set_led_preview(self.settings.led_preview);
                 let _ = self.settings.save();
             }
-            if preview {
-                let mut brightness = self.editor.brightness_percent();
-                if ui
-                    .add(egui::Slider::new(&mut brightness, 15..=25).suffix("%"))
+            if self.settings.led_preview
+                && ui
+                    .add(
+                        egui::Slider::new(&mut self.settings.brightness_percent, 15..=25)
+                            .suffix("%"),
+                    )
                     .changed()
-                {
-                    self.editor.set_brightness_percent(brightness);
-                    self.settings.brightness_percent = brightness;
-                    let _ = self.settings.save();
-                }
+            {
+                self.editor
+                    .set_brightness_percent(self.settings.brightness_percent);
+                let _ = self.settings.save();
             }
 
             ui.separator();
@@ -822,11 +1167,115 @@ impl StudioApp {
         }
 
         ui.add_space(8.0);
-        ui.label("에셋 (S2 합의 후 활성화)");
-        ui.colored_label(egui::Color32::from_gray(130), "  sprites/");
-        ui.colored_label(egui::Color32::from_gray(130), "  sounds/");
-        ui.colored_label(egui::Color32::from_gray(130), "  fonts/");
-        ui.colored_label(egui::Color32::from_gray(130), "  icon.png");
+        ui.horizontal(|ui| {
+            ui.label("에셋");
+            if ui
+                .small_button("↻")
+                .on_hover_text("에셋 목록 새로고침")
+                .clicked()
+            {
+                self.refresh_asset_lists();
+            }
+        });
+
+        // 클릭한 에셋을 루프 종료 후 바로 열기 위한 임시 변수
+        let mut open_sprite: Option<String> = None;
+        let mut open_sound: Option<String> = None;
+
+        // 1) sprites/ 목록 (클릭 시 스프라이트 탭으로 바로 불러오기)
+        egui::CollapsingHeader::new("sprites/")
+            .default_open(true)
+            .show(ui, |ui| {
+                if self.sprite_files.is_empty() {
+                    ui.colored_label(egui::Color32::from_gray(130), "  (비어 있음)");
+                } else {
+                    for name in &self.sprite_files {
+                        let selected =
+                            active == TabKind::SpriteEditor && self.sprite_asset_name == *name;
+                        if ui
+                            .selectable_label(selected, format!("{name}.png"))
+                            .clicked()
+                        {
+                            open_sprite = Some(name.clone());
+                        }
+                    }
+                }
+            });
+
+        // 2) sounds/ 목록 (클릭 시 효과음 탭으로 바로 불러오기)
+        egui::CollapsingHeader::new("sounds/")
+            .default_open(true)
+            .show(ui, |ui| {
+                if self.sound_files.is_empty() {
+                    ui.colored_label(egui::Color32::from_gray(130), "  (비어 있음)");
+                } else {
+                    for name in &self.sound_files {
+                        let selected =
+                            active == TabKind::SoundTool && self.sound_tab.asset_name == *name;
+                        if ui
+                            .selectable_label(selected, format!("{name}.sound.toml"))
+                            .clicked()
+                        {
+                            open_sound = Some(name.clone());
+                        }
+                    }
+                }
+            });
+
+        let mut open_font: Option<String> = None;
+        let mut open_icon = false;
+
+        // 3) fonts/ 목록 (클릭 시 글꼴 탭으로 바로 불러오기)
+        egui::CollapsingHeader::new("fonts/")
+            .default_open(true)
+            .show(ui, |ui| {
+                if self.font_files.is_empty() {
+                    ui.colored_label(egui::Color32::from_gray(130), "  (비어 있음)");
+                } else {
+                    for name in &self.font_files {
+                        let selected =
+                            active == TabKind::FontTool && self.font_tab.asset_name == *name;
+                        if ui
+                            .selectable_label(selected, format!("{name}.font.toml"))
+                            .clicked()
+                        {
+                            open_font = Some(name.clone());
+                        }
+                    }
+                }
+            });
+
+        // 4) icon.png (클릭 시 16×16 아이콘 편집 모드로 바로 열기)
+        let icon_label = if self.has_icon {
+            "icon.png"
+        } else {
+            "icon.png (새로 만들기)"
+        };
+        let icon_selected = active == TabKind::SpriteEditor && self.editing_icon;
+        if ui.selectable_label(icon_selected, icon_label).clicked() {
+            open_icon = true;
+        }
+
+        // 클릭된 에셋 파일 즉시 불러오기 및 해당 편집기 탭 활성화
+        if let Some(name) = open_sprite {
+            self.editing_icon = false;
+            self.sprite_asset_name = name;
+            self.load_current_sprite();
+            self.tabs.open(TabKind::SpriteEditor);
+        }
+        if let Some(name) = open_sound {
+            self.sound_tab.asset_name = name;
+            self.load_current_sound();
+            self.tabs.open(TabKind::SoundTool);
+        }
+        if let Some(name) = open_font {
+            self.font_tab.asset_name = name;
+            self.load_current_font();
+            self.tabs.open(TabKind::FontTool);
+        }
+        if open_icon {
+            self.open_icon_png();
+        }
 
         ui.add_space(8.0);
         ui.separator();
@@ -1204,14 +1653,15 @@ impl StudioApp {
         });
     }
 
-    // 스프라이트 편집기 도구 모음 (화면 모드 전환 · 전체 지우기 · 실행 취소/다시 실행)
+    // 스프라이트 편집기 도구 모음 (화면 모드 전환 · 전체 지우기 · 실행 취소/다시 실행 · 파일 저장/불러오기)
     fn show_sprite_toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label("화면 모드:");
             let is_wide = matches!(self.editor.layout(), ScreenLayout::Wide);
 
-            // Wide(32×16) 전환 버튼 (캔버스 크기가 바뀌므로 이력 초기화)
+            // Wide(32×16) 전환 버튼 (캔버스 크기가 바뀌므로 이력 초기화 및 아이콘 모드 해제)
             if ui.selectable_label(is_wide, "Wide (32×16)").clicked() && !is_wide {
+                self.editing_icon = false;
                 self.editor.set_layout(ScreenLayout::Wide);
                 self.canvas_history.reset();
                 self.canvas_drag_before = None;
@@ -1257,6 +1707,35 @@ impl StudioApp {
                 .clicked()
             {
                 self.canvas_history.redo(&mut self.editor);
+            }
+        });
+
+        // 스프라이트 / 아이콘 파일 저장·불러오기 바
+        ui.horizontal(|ui| {
+            if self.editing_icon {
+                ui.strong("아이콘 편집 모드 (assets/icon.png · 16×16)");
+                if ui.button("💾 icon.png 저장 (Ctrl+S)").clicked() {
+                    self.save_current_sprite();
+                }
+                if ui.button("일반 스프라이트로 전환").clicked() {
+                    self.editing_icon = false;
+                }
+            } else {
+                ui.label("파일명 (sprites/*.png):");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.sprite_asset_name)
+                        .hint_text("예: player_run")
+                        .desired_width(140.0),
+                );
+                if ui.button("💾 저장 (Ctrl+S)").clicked() {
+                    self.save_current_sprite();
+                }
+                if ui.button("📂 불러오기").clicked() {
+                    self.load_current_sprite();
+                }
+            }
+            if !self.sprite_io_status.is_empty() {
+                ui.label(&self.sprite_io_status);
             }
         });
     }
@@ -1383,24 +1862,33 @@ impl StudioApp {
 
     // 글꼴 변환과 미리보기 탭 화면
     fn show_font_tab(&mut self, ui: &mut egui::Ui) {
+        // 글꼴 파일 저장·불러오기 바 (assets/fonts/<이름>.font.toml)
         ui.horizontal(|ui| {
-            ui.label("TTF/OTF 경로:");
-            ui.text_edit_singleline(&mut self.font_tab.font_path);
-            if ui.button("폰트 불러오기").clicked() {
-                match FontConverter::from_file(Path::new(&self.font_tab.font_path)) {
-                    Ok(converter) => {
-                        self.font_tab.converter = Some(converter);
-                        self.font_tab.status_message = "폰트 불러오기 완료!".to_string();
-                    }
-                    Err(err) => {
-                        self.font_tab.converter = None;
-                        self.font_tab.status_message = err;
-                    }
-                }
+            ui.label("파일명 (fonts/*.font.toml):");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.font_tab.asset_name)
+                    .hint_text("예: main")
+                    .desired_width(120.0),
+            );
+            if ui.button("💾 저장 (Ctrl+S)").clicked() {
+                self.save_current_font();
+            }
+            if ui.button("📂 불러오기").clicked() {
+                self.load_current_font();
+            }
+            if !self.font_tab.io_status.is_empty() {
+                ui.label(&self.font_tab.io_status);
             }
         });
-        ui.label(&self.font_tab.status_message);
-        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label("라이선스:");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.font_tab.license)
+                    .hint_text("예: OFL-1.1 / MIT")
+                    .desired_width(200.0),
+            );
+        });
+        ui.add_space(4.0);
 
         ui.horizontal(|ui| {
             ui.label("픽셀 크기:");
@@ -1439,17 +1927,38 @@ impl StudioApp {
                 self.font_tab.config.threshold,
                 Rgb::WHITE,
             );
+            // 전역 밝기 설정(self.settings)을 직접 참조해 스프라이트 편집기와 상태 완전 분리
             draw_framebuffer_preview(
                 ui,
                 &fb,
-                self.editor.led_preview(),
-                self.editor.brightness_percent(),
+                self.settings.led_preview,
+                self.settings.brightness_percent,
             );
         }
     }
 
     // 효과음·멜로디 편집기 탭 화면 (모든 변경을 명령 객체로 기록해 Ctrl+Z/Y 지원)
     fn show_sound_tab(&mut self, ui: &mut egui::Ui) {
+        // 효과음 파일 저장·불러오기 바 (assets/sounds/<이름>.sound.toml)
+        ui.horizontal(|ui| {
+            ui.label("파일명 (sounds/*.sound.toml):");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.sound_tab.asset_name)
+                    .hint_text("예: jump")
+                    .desired_width(140.0),
+            );
+            if ui.button("💾 저장 (Ctrl+S)").clicked() {
+                self.save_current_sound();
+            }
+            if ui.button("📂 불러오기").clicked() {
+                self.load_current_sound();
+            }
+            if !self.sound_tab.status_message.is_empty() {
+                ui.label(&self.sound_tab.status_message);
+            }
+        });
+        ui.add_space(4.0);
+
         // 1) 상단 재생·초기화·실행 취소/다시 실행 버튼 바
         ui.horizontal(|ui| {
             if ui.button("▶ 전체 재생").clicked() {
@@ -1584,38 +2093,56 @@ impl StudioApp {
         }
     }
 
-    // 기기 패널 탭 화면
+    // 기기 패널 탭 화면 (열린 프로젝트 경로 고정 · 구조화 doctor · 실시간 실행/중지)
     fn show_device_tab(&mut self, ui: &mut egui::Ui) {
-        let is_busy = self.device_tab.pending_rx.is_some();
+        let is_busy = self.device_tab.running_cmd.is_some();
+        let project_root = self
+            .opened
+            .as_ref()
+            .map(|o| o.project.root().display().to_string())
+            .unwrap_or_default();
 
+        // 프로젝트 경로는 열린 프로젝트 루트로 고정(읽기 전용)
         ui.horizontal(|ui| {
-            ui.label("프로젝트 경로:");
-            ui.text_edit_singleline(&mut self.device_tab.project_dir);
+            ui.label("열린 프로젝트:");
+            ui.monospace(&project_root);
             ui.separator();
             ui.label("CLI 명령:");
-            ui.text_edit_singleline(&mut self.device_tab.dotbox_bin);
+            ui.add(
+                egui::TextEdit::singleline(&mut self.device_tab.dotbox_bin).desired_width(120.0),
+            );
         });
         ui.add_space(6.0);
 
         ui.horizontal(|ui| {
+            // 구조화된 dotbox_tools::doctor::run으로 점검 후 개요 탭으로 이동
+            let doctor_busy = self.doctor_rx.is_some();
             if ui
-                .add_enabled(!is_busy, egui::Button::new("환경 점검 (dotbox doctor)"))
+                .add_enabled(!doctor_busy, egui::Button::new("환경 점검 (개요/문제)"))
                 .clicked()
             {
-                self.show_bottom_panel = true;
-                self.bottom_tab = BottomTab::Output;
-                self.launch_cli_command(build_doctor_args());
+                self.start_doctor_check();
+                self.tabs.open(TabKind::Overview);
             }
+
             if ui
-                .add_enabled(!is_busy, egui::Button::new("시뮬레이터 실행 (dotbox run)"))
+                .add_enabled(
+                    !is_busy,
+                    egui::Button::new("▶ 시뮬레이터 실행 (dotbox run)"),
+                )
                 .clicked()
             {
                 self.show_bottom_panel = true;
                 self.bottom_tab = BottomTab::Output;
                 self.launch_cli_command(build_run_args());
             }
+
+            // 실행 중인 명령이 있을 때 즉시 종료할 수 있는 중지 버튼
             if is_busy {
-                ui.label("명령 실행 중...");
+                if ui.button("■ 중지").clicked() {
+                    self.stop_cli_command();
+                }
+                ui.label("실행 중... (하단 출력 패널에 실시간 표시)");
             }
         });
         ui.separator();
@@ -1668,7 +2195,6 @@ impl StudioApp {
                 .add_enabled(!is_busy, egui::Button::new("펌웨어 플래시 실행"))
                 .clicked()
             {
-                // 프로젝트 설정에 저장된 오른쪽 포트도 함께 전달
                 let right_port = self
                     .opened
                     .as_ref()
@@ -1686,15 +2212,33 @@ impl StudioApp {
         });
     }
 
-    // 기기 패널에서 CLI 명령을 백그라운드로 시작하는 공통 헬퍼
+    // 현재 열린 프로젝트 루트에서 CLI 명령을 줄 단위 스트리밍으로 시작
     fn launch_cli_command(&mut self, args: Vec<String>) {
-        self.device_tab.output_log = "명령을 실행하는 중입니다...".to_string();
-        let rx = run_command_async(
-            self.device_tab.dotbox_bin.clone(),
-            args,
-            PathBuf::from(&self.device_tab.project_dir),
-        );
-        self.device_tab.pending_rx = Some(rx);
+        let Some(work_dir) = self.opened.as_ref().map(|o| o.project.root().to_path_buf()) else {
+            return;
+        };
+
+        let header = format!("$ {}\n", format_command(&self.device_tab.dotbox_bin, &args));
+        match spawn_command_streaming(&self.device_tab.dotbox_bin, &args, &work_dir) {
+            Ok(running) => {
+                self.device_tab.output_log = header; // 명령 헤더 표시 후 실시간 줄 추가
+                self.device_tab.running_cmd = Some(running);
+            }
+            Err(err) => {
+                self.device_tab.output_log = err; // 실행 실패 시 즉시 오류 출력
+                self.device_tab.running_cmd = None;
+            }
+        }
+    }
+
+    // 실행 중인 CLI 자식 프로세스를 즉시 중지하고 로그에 기록
+    fn stop_cli_command(&mut self) {
+        if let Some(mut cmd) = self.device_tab.running_cmd.take() {
+            cmd.stop();
+            self.device_tab
+                .output_log
+                .push_str("\n[중지됨] 사용자 요청으로 프로세스를 종료했습니다.\n");
+        }
     }
 }
 
@@ -1771,6 +2315,8 @@ fn to_color32(color: Rgb) -> egui::Color32 {
 // 매 프레임 화면을 갱신하는 egui 루프
 impl eframe::App for StudioApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // OS 창 닫기(X) 요청 감지: 미저장 탭 확인 및 마지막 창 크기 저장
+        self.handle_window_close(ui.ctx());
         // 백그라운드 작업(doctor, CLI) 완료 여부 매 프레임 확인
         self.poll_background_tasks(ui.ctx());
 

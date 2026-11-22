@@ -1,6 +1,7 @@
 use serialport::SerialPortType;
-use std::path::PathBuf;
-use std::process::Command;
+use std::io::{BufRead, BufReader};
+use std::path::Path;
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 
 // 플래시 대상 모듈 선택 (좌측 / 우측 / 양쪽 동시)
@@ -71,20 +72,14 @@ pub fn scan_serial_ports() -> Result<Vec<DetectedPort>, String> {
     Ok(result)
 }
 
-// `dotbox doctor` 명령 인자 목록 생성
-pub fn build_doctor_args() -> Vec<String> {
-    vec!["doctor".to_string()]
-}
-
 // `dotbox run` 명령 인자 목록 생성
 pub fn build_run_args() -> Vec<String> {
     vec!["run".to_string()]
 }
 
 // `dotbox flash` 명령 인자 목록 생성 (`docs/cli.md`의 flash 명세를 따른다)
-// - 한쪽만 구울 때: `flash --side left -p COM3`
+// - 한쪽만 구울 때: `flash --side left --port COM3`
 // - 양쪽을 구울 때: `flash --side both --left-port COM3 --right-port COM4`
-// 포트 문자열이 비어 있으면 해당 옵션을 빼고 CLI의 자동 포트 결정에 맡긴다.
 pub fn build_flash_args(target: FlashTarget, port: &str, right_port: &str) -> Vec<String> {
     let mut args = vec![
         "flash".to_string(),
@@ -118,70 +113,94 @@ pub fn format_command(program: &str, args: &[String]) -> String {
     }
 }
 
-// CLI 명령을 백그라운드 스레드에서 실행하고 결과 수신 채널 반환 (GUI 멈춤 방지)
-pub fn run_command_async(
-    program: String,
-    args: Vec<String>,
-    work_dir: PathBuf,
-) -> Receiver<String> {
-    let (tx, rx) = mpsc::channel(); // 작업 완료 결과를 돌려받을 채널 생성
-
-    // GUI 프레임을 막지 않도록 별도 스레드에서 프로세스 실행
-    std::thread::spawn(move || {
-        let cmd_line = format_command(&program, &args); // 실행한 명령 문자열 기록
-        let output = Command::new(&program)
-            .args(&args)
-            .current_dir(&work_dir)
-            .output();
-
-        // 실행 성공/실패 결과를 읽기 쉬운 텍스트 로그로 정리
-        let report = match output {
-            Ok(out) => {
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                let status_text = if out.status.success() {
-                    "성공 (종료 코드 0)".to_string()
-                } else {
-                    format!("실패 ({})", out.status)
-                };
-
-                let mut text = format!("$ {cmd_line}\n상태: {status_text}\n");
-                if !stdout.trim().is_empty() {
-                    text.push_str("\n[출력]\n");
-                    text.push_str(&stdout);
-                }
-                if !stderr.trim().is_empty() {
-                    text.push_str("\n[오류]\n");
-                    text.push_str(&stderr);
-                }
-                text
-            }
-            Err(err) => {
-                // dotbox 실행 파일이 없거나 경로가 잘못된 경우 안내 메시지 출력
-                format!(
-                    "$ {cmd_line}\n명령을 실행할 수 없습니다: {err}\n\
-                     힌트: `dotbox` CLI가 PATH에 설치되어 있는지, 또는 프로젝트 경로가 올바른지 확인하세요."
-                )
-            }
-        };
-
-        // 결과를 메인 GUI 스레드로 전송 (창이 닫혔으면 조용히 무시)
-        let _ = tx.send(report);
-    });
-
-    rx
+// 백그라운드에서 실행 중인 자식 프로세스와 줄 단위 출력 채널 핸들
+pub struct RunningCommand {
+    child: Child,         // 중지(kill) 및 종료 여부 확인용 자식 프로세스 핸들
+    rx: Receiver<String>, // stdout·stderr 리더 스레드가 보내는 줄 단위 로그 채널
 }
 
-// GUI와 실제 기기 없이 명령 인자 생성 로직만 검증하는 단위 테스트
+impl RunningCommand {
+    // 현재까지 도착한 모든 출력 줄을 비차단으로 수집
+    pub fn poll_lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        while let Ok(line) = self.rx.try_recv() {
+            lines.push(line);
+        }
+        lines
+    }
+
+    // 프로세스가 종료되었는지 확인 (종료됐으면 상태 문자열 반환, 실행 중이면 None)
+    pub fn try_finish(&mut self) -> Option<String> {
+        match self.child.try_wait() {
+            Ok(Some(status)) => {
+                if status.success() {
+                    Some("상태: 성공 (종료 코드 0)".to_string())
+                } else {
+                    Some(format!("상태: 실패 ({status})"))
+                }
+            }
+            Ok(None) => None, // 아직 실행 중
+            Err(err) => Some(format!("상태 확인 실패: {err}")),
+        }
+    }
+
+    // 실행 중인 자식 프로세스를 강제 종료하고 정리 ([■ 중지] 버튼용)
+    pub fn stop(&mut self) {
+        let _ = self.child.kill(); // 프로세스 종료 신호 전송
+        let _ = self.child.wait(); // 좀비 프로세스 방지 대기
+    }
+}
+
+// CLI 명령을 자식 프로세스로 띄우고 stdout·stderr를 줄 단위로 스트리밍
+pub fn spawn_command_streaming(
+    program: &str,
+    args: &[String],
+    work_dir: &Path,
+) -> Result<RunningCommand, String> {
+    let cmd_line = format_command(program, args);
+    let mut child = Command::new(program)
+        .args(args)
+        .current_dir(work_dir)
+        .stdout(Stdio::piped()) // 표준 출력 파이프 연결
+        .stderr(Stdio::piped()) // 표준 오류 파이프 연결
+        .spawn()
+        .map_err(|err| {
+            format!(
+                "$ {cmd_line}\n명령을 실행할 수 없습니다: {err}\n\
+                 힌트: `dotbox` CLI가 PATH에 설치되어 있는지 확인하세요."
+            )
+        })?;
+
+    let (tx, rx) = mpsc::channel::<String>();
+
+    // stdout을 줄 단위로 읽어 채널에 전송하는 리더 스레드
+    if let Some(stdout) = child.stdout.take() {
+        let tx_out = tx.clone();
+        std::thread::spawn(move || {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines().map_while(Result::ok) {
+                let _ = tx_out.send(line);
+            }
+        });
+    }
+
+    // stderr를 줄 단위로 읽어 채널에 전송하는 리더 스레드
+    if let Some(stderr) = child.stderr.take() {
+        std::thread::spawn(move || {
+            let reader = BufReader::new(stderr);
+            for line in reader.lines().map_while(Result::ok) {
+                let _ = tx.send(line);
+            }
+        });
+    }
+
+    Ok(RunningCommand { child, rx })
+}
+
+// GUI와 실제 기기 없이 명령 인자 생성·실행 실패 처리를 검증하는 단위 테스트
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // doctor 명령 인자가 올바르게 생성되는지 검증
-    #[test]
-    fn doctor_args_match_expected() {
-        assert_eq!(build_doctor_args(), vec!["doctor"]);
-    }
 
     // 단일 모듈 플래시 시 --side와 --port 옵션이 포함되는지 검증
     #[test]
@@ -219,5 +238,16 @@ mod tests {
             build_flash_args(FlashTarget::Both, "", " COM4 "),
             vec!["flash", "--side", "both", "--right-port", "COM4"]
         );
+    }
+
+    // 존재하지 않는 CLI 실행 시 패닉 없이 안내 오류 문자열을 반환하는지 검증
+    #[test]
+    fn spawn_missing_binary_returns_error_message() {
+        let result = spawn_command_streaming(
+            "nonexistent-dotbox-binary-xyz",
+            &build_run_args(),
+            Path::new("."),
+        );
+        assert!(result.is_err());
     }
 }

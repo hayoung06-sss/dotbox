@@ -113,6 +113,15 @@ impl UserSettings {
     pub fn remove_recent(&mut self, path: &Path) {
         self.recent_projects.retain(|existing| existing != path); // 일치하는 항목만 제외
     }
+
+    // 마지막 창 크기를 최소 크기 이상으로 보정해 설정에 반영 (최소화·비정상 크기 방지)
+    pub fn update_window_size(&mut self, width: f32, height: f32) {
+        // NaN·무한대 같은 비정상 실수 값은 무시
+        if width.is_finite() && height.is_finite() {
+            self.window_width = width.max(640.0); // 최소 너비 640px 보장
+            self.window_height = height.max(480.0); // 최소 높이 480px 보장
+        }
+    }
 }
 
 // GUI 없이 사용자 설정 저장·불러오기 및 최근 목록 로직을 검증하는 단위 테스트
@@ -158,5 +167,26 @@ mod tests {
         settings.save_to(&path).unwrap(); // 파일로 저장
         let loaded = UserSettings::load_from(&path); // 다시 읽기
         assert_eq!(loaded, settings); // 저장 전후 값 일치 확인
+    }
+
+    // 창 크기 갱신 시 최소 크기 보정 및 비정상 값 무시가 동작하는지 검증
+    #[test]
+    fn update_window_size_clamps_minimum_and_ignores_nan() {
+        let mut settings = UserSettings::default();
+
+        // 너무 작은 창 크기는 최소 640×480으로 보정되어야 함
+        settings.update_window_size(200.0, 100.0);
+        assert_eq!(settings.window_width, 640.0);
+        assert_eq!(settings.window_height, 480.0);
+
+        // 정상 크기는 그대로 반영되어야 함
+        settings.update_window_size(1280.0, 800.0);
+        assert_eq!(settings.window_width, 1280.0);
+        assert_eq!(settings.window_height, 800.0);
+
+        // NaN 값은 기존 값을 덮어쓰지 않고 무시해야 함
+        settings.update_window_size(f32::NAN, 900.0);
+        assert_eq!(settings.window_width, 1280.0);
+        assert_eq!(settings.window_height, 800.0);
     }
 }

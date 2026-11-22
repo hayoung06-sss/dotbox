@@ -100,6 +100,11 @@ impl<T> CommandHistory<T> {
         self.saved_cursor != Some(self.cursor)
     }
 
+    // 현재 커서 위치를 마지막 저장 시점으로 기록 (저장 성공 시 ● 표시 해제)
+    pub fn mark_saved(&mut self) {
+        self.saved_cursor = Some(self.cursor);
+    }
+
     // 이력을 모두 비우고 초기 깨끗한 상태로 되돌림 (프로젝트 전환 등)
     pub fn reset(&mut self) {
         self.commands.clear();
