@@ -145,70 +145,44 @@ impl EditCommand<crate::sound::MelodyEditor> for ReplaceMelodyCommand {
     }
 }
 
-// 캔버스의 원본 RGB 픽셀 전체를 1차원 벡터로 추출하는 헬퍼
-pub fn snapshot_canvas(editor: &mut crate::editor::CanvasEditor) -> Vec<dotbox_core::hal::Rgb> {
-    let width = editor.width(); // 현재 캔버스 가로 크기
-    let height = editor.height(); // 현재 캔버스 세로 크기
-    // 실기기 밝기 미리보기가 켜져 있으면 어두워진 색이 나오므로 잠시 끄고 원본 색 조회
-    let prev_preview = editor.led_preview();
-    editor.set_led_preview(false);
-
+// 현재 활성 프레임의 원본 RGB 픽셀 전체를 1차원 벡터로 추출하는 헬퍼 (PNG 저장용)
+pub fn snapshot_canvas(editor: &crate::editor::CanvasEditor) -> Vec<dotbox_core::hal::Rgb> {
+    let width = editor.width();
+    let height = editor.height();
     let mut pixels = Vec::with_capacity(width * height);
     for y in 0..height {
         for x in 0..width {
-            pixels.push(editor.display_color(x, y)); // (x, y) 원본 RGB 저장
+            pixels.push(editor.pixel(x, y)); // 원본 RGB 조회 (밝기 미리보기 영향 없음)
         }
     }
-
-    // 원래의 밝기 미리보기 설정으로 즉시 복원
-    editor.set_led_preview(prev_preview);
     pixels
 }
 
-// 보관해 둔 1차원 RGB 픽셀 스냅샷을 캔버스에 그대로 복원하는 헬퍼
-pub fn restore_canvas(editor: &mut crate::editor::CanvasEditor, pixels: &[dotbox_core::hal::Rgb]) {
-    let width = editor.width(); // 현재 캔버스 가로 크기
-    let height = editor.height(); // 현재 캔버스 세로 크기
-    // 사용자가 선택해 둔 브러시 색이 바뀌지 않도록 미리 백업
-    let prev_color = editor.selected_color();
-
-    for y in 0..height {
-        for x in 0..width {
-            let idx = y * width + x;
-            // 스냅샷 크기가 현재 캔버스와 맞을 때만 안전하게 픽셀 복원
-            if let Some(&color) = pixels.get(idx) {
-                editor.set_selected_color(color);
-                editor.paint_pixel(x, y);
-            }
-        }
-    }
-
-    // 백업해 둔 사용자 브러시 색 복원
-    editor.set_selected_color(prev_color);
-}
-
-// 스프라이트 캔버스의 픽셀 전체를 변경 전/후 스냅샷으로 교체하는 명령 객체
+// 스프라이트 전체 상태(크기·모든 프레임·선택 인덱스)를 교체하는 명령 객체
 pub struct ReplaceCanvasCommand {
-    before: Vec<dotbox_core::hal::Rgb>, // 편집 전 캔버스 픽셀
-    after: Vec<dotbox_core::hal::Rgb>,  // 편집 후 캔버스 픽셀
+    before: crate::editor::SpriteSnapshot, // 편집 전 전체 상태
+    after: crate::editor::SpriteSnapshot,  // 편집 후 전체 상태
 }
 
 impl ReplaceCanvasCommand {
-    // 변경 전·후 픽셀 스냅샷으로 명령 객체 생성
-    pub fn new(before: Vec<dotbox_core::hal::Rgb>, after: Vec<dotbox_core::hal::Rgb>) -> Self {
+    // 변경 전·후 스냅샷으로 명령 객체 생성
+    pub fn new(
+        before: crate::editor::SpriteSnapshot,
+        after: crate::editor::SpriteSnapshot,
+    ) -> Self {
         Self { before, after }
     }
 }
 
 impl EditCommand<crate::editor::CanvasEditor> for ReplaceCanvasCommand {
-    // 변경 후 캔버스 상태로 적용
+    // 변경 후 스프라이트 상태로 적용
     fn apply(&self, target: &mut crate::editor::CanvasEditor) {
-        restore_canvas(target, &self.after);
+        target.restore_state(&self.after);
     }
 
-    // 변경 전 캔버스 상태로 되돌리기
+    // 변경 전 스프라이트 상태로 되돌리기
     fn undo(&self, target: &mut crate::editor::CanvasEditor) {
-        restore_canvas(target, &self.before);
+        target.restore_state(&self.before);
     }
 }
 
@@ -223,70 +197,61 @@ mod tests {
 
     impl EditCommand<i32> for AddValue {
         fn apply(&self, target: &mut i32) {
-            *target += self.0; // 값 더하기
+            *target += self.0;
         }
         fn undo(&self, target: &mut i32) {
-            *target -= self.0; // 값 빼기
+            *target -= self.0;
         }
     }
 
-    // 실행 -> 취소 -> 다시 실행 시 상태와 더티 여부가 정확한지 검증
     #[test]
     fn execute_undo_redo_and_dirty_tracking() {
         let mut value = 10;
         let mut history = CommandHistory::new();
-        assert!(!history.is_dirty()); // 초기 상태는 깨끗함
+        assert!(!history.is_dirty());
 
-        // 명령 2개 연속 실행 (10 -> 15 -> 18)
         history.execute(&mut value, Box::new(AddValue(5)));
         history.execute(&mut value, Box::new(AddValue(3)));
         assert_eq!(value, 18);
-        assert!(history.is_dirty()); // 수정되었으므로 더티
+        assert!(history.is_dirty());
 
-        // 1회 실행 취소 (18 -> 15)
         assert!(history.undo(&mut value));
         assert_eq!(value, 15);
         assert!(history.is_dirty());
 
-        // 한 번 더 실행 취소해 초기 상태(10)로 돌아오면 더티 해제
         assert!(history.undo(&mut value));
         assert_eq!(value, 10);
         assert!(!history.is_dirty());
 
-        // 더 이상 취소할 명령이 없으면 false 반환
         assert!(!history.undo(&mut value));
 
-        // 다시 실행 (10 -> 15)
         assert!(history.redo(&mut value));
         assert_eq!(value, 15);
         assert!(history.is_dirty());
     }
 
-    // 실행 취소 후 새 명령을 실행하면 기존 redo 분기가 버려지는지 검증
     #[test]
     fn new_command_clears_redo_branch() {
         let mut value = 0;
         let mut history = CommandHistory::new();
 
-        history.execute(&mut value, Box::new(AddValue(10))); // 0 -> 10
-        assert!(history.undo(&mut value)); // 10 -> 0
+        history.execute(&mut value, Box::new(AddValue(10)));
+        assert!(history.undo(&mut value));
         assert!(history.can_redo());
 
-        // 새 명령 실행 시 기존 redo(+10)는 폐기되어야 함
-        history.execute(&mut value, Box::new(AddValue(7))); // 0 -> 7
+        history.execute(&mut value, Box::new(AddValue(7)));
         assert_eq!(value, 7);
         assert!(!history.can_redo());
     }
 
-    // 멜로디 편집기 명령 객체가 음표 추가·취소·재실행을 정확히 복원하는지 검증
     #[test]
     fn replace_melody_command_round_trip() {
         let mut melody = MelodyEditor::default();
-        melody.clear(); // 빈 상태에서 시작
+        melody.clear();
         let mut history = CommandHistory::new();
 
         let before = vec![];
-        let after = vec![(523, 120), (784, 80)]; // 도 -> 솔
+        let after = vec![(523, 120), (784, 80)];
         history.execute(
             &mut melody,
             Box::new(ReplaceMelodyCommand::new(before, after)),
@@ -294,30 +259,26 @@ mod tests {
         assert_eq!(melody.notes().len(), 2);
         assert_eq!(melody.notes()[0].freq_hz, 523);
 
-        // 실행 취소하면 다시 비어 있어야 함
         assert!(history.undo(&mut melody));
         assert!(melody.notes().is_empty());
 
-        // 다시 실행하면 음표 2개가 그대로 복원되어야 함
         assert!(history.redo(&mut melody));
         assert_eq!(melody.notes().len(), 2);
         assert_eq!(melody.notes()[1].freq_hz, 784);
     }
 
-    // 스프라이트 캔버스 명령 객체가 픽셀 그리기·실행 취소·다시 실행을 정확히 복원하는지 검증
+    // 스프라이트 캔버스·프레임 명령 객체의 실행 취소·다시 실행 검증
     #[test]
     fn replace_canvas_command_round_trip() {
         let mut editor = crate::editor::CanvasEditor::new();
         let mut history = CommandHistory::new();
         let red = dotbox_core::hal::Rgb::new(255, 0, 0);
 
-        // 편집 전 스냅샷 추출 후 (2, 3) 위치에 빨간 점 찍기
-        let before = snapshot_canvas(&mut editor);
+        let before = editor.snapshot_state();
         editor.set_selected_color(red);
         editor.paint_pixel(2, 3);
-        let after = snapshot_canvas(&mut editor);
+        let after = editor.snapshot_state();
 
-        // 명령 객체로 기록
         history.execute(
             &mut editor,
             Box::new(ReplaceCanvasCommand::new(before, after)),
@@ -325,12 +286,10 @@ mod tests {
         assert_eq!(editor.display_color(2, 3), red);
         assert!(history.is_dirty());
 
-        // 실행 취소하면 검은색으로 돌아가고 더티 상태도 해제되어야 함
         assert!(history.undo(&mut editor));
         assert_eq!(editor.display_color(2, 3), dotbox_core::hal::Rgb::BLACK);
         assert!(!history.is_dirty());
 
-        // 다시 실행하면 빨간 점이 복원되어야 함
         assert!(history.redo(&mut editor));
         assert_eq!(editor.display_color(2, 3), red);
         assert!(history.is_dirty());

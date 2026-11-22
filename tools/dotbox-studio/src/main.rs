@@ -1,4 +1,4 @@
-mod asset_io;
+mod asset_io; // 스프라이트(.png) · 효과음(.sound.toml) · 글꼴(.font.toml) · 아이콘 파일 입출력 모듈
 mod command; // GUI 독립 편집 명령 객체 및 실행 취소/다시 실행 모듈
 mod device; // 4순위: 환경 점검·포트 감지·플래시 로직 모듈
 mod editor; // 1순위: 스프라이트·화면 편집 로직 모듈
@@ -6,7 +6,7 @@ mod font; // 2순위: 글꼴 변환·미리보기 로직 모듈
 mod settings; // 사용자 전역 설정 (최근 프로젝트, 창 크기, 밝기)
 mod sound; // 3순위: 효과음·멜로디 편집 및 재생 로직 모듈
 mod tabs; // 파일 단위 탭 및 더티(●) 상태 관리 모듈
-mod workspace; // 프로젝트 열기·생성·설정 저장·doctor 실행 모듈 // 스프라이트(.png) · 효과음(.sound.toml) 파일 저장/불러오기 모듈
+mod workspace; // 프로젝트 열기·생성·설정 저장·doctor 실행 모듈
 
 // 명령 객체, 이력 관리자, 캔버스 스냅샷 헬퍼 불러오기
 use asset_io::{
@@ -14,9 +14,7 @@ use asset_io::{
     load_font_toml, load_sound_toml, load_sprite_png, save_font_toml, save_sound_toml,
     save_sprite_png, validate_asset_name,
 };
-use command::{
-    CommandHistory, ReplaceCanvasCommand, ReplaceMelodyCommand, restore_canvas, snapshot_canvas,
-};
+use command::{CommandHistory, ReplaceCanvasCommand, ReplaceMelodyCommand, snapshot_canvas};
 use device::{
     DetectedPort, FlashTarget, RunningCommand, build_flash_args, build_run_args, format_command,
     scan_serial_ports, spawn_command_streaming,
@@ -24,7 +22,7 @@ use device::{
 use dotbox_core::display::{FrameBuffer, PANEL_WIDTH, ScreenLayout};
 use dotbox_core::hal::Rgb;
 use dotbox_tools::doctor::{Level, Report};
-use editor::{CanvasEditor, DrawTool, PALETTE, scale_brightness};
+use editor::{CanvasEditor, DrawTool, PALETTE, SpriteSnapshot, scale_brightness};
 use eframe::egui;
 use font::{FontConfig, FontConverter};
 use settings::UserSettings;
@@ -205,9 +203,11 @@ struct StudioApp {
     show_bottom_panel: bool,        // 하단 패널 펼침 여부
     editor: CanvasEditor,           // 스프라이트·화면 편집기 상태
     canvas_history: CommandHistory<CanvasEditor>, // 스프라이트 탭 독립 Undo/Redo 이력
-    canvas_drag_before: Option<Vec<Rgb>>, // 마우스 드래그 시작 시점의 캔버스 스냅샷
+    canvas_drag_before: Option<SpriteSnapshot>, // 마우스 드래그 시작 시점의 스프라이트 스냅샷
     draw_tool: DrawTool,            // 현재 선택된 스프라이트 그리기 도구
     shape_start: Option<(usize, usize)>, // 직선·사각형 드래그 시작 좌표
+    anim_playing: bool,             // 애니메이션 재생 미리보기 실행 여부
+    anim_elapsed_ms: f32,           // 현재 프레임 경과 시간 (ms)
     font_tab: FontTabState,         // 글꼴 변환기 상태
     sound_tab: SoundTabState,       // 효과음·멜로디 편집기 상태 (Undo/Redo 포함)
     device_tab: DeviceTabState,     // 기기 패널 상태
@@ -246,6 +246,8 @@ impl StudioApp {
             canvas_drag_before: None,              // 드래그 중 아님
             draw_tool: DrawTool::Pencil,
             shape_start: None,
+            anim_playing: false,
+            anim_elapsed_ms: 0.0,
             font_tab: FontTabState::default(),
             sound_tab: SoundTabState::default(),
             device_tab: DeviceTabState::default(),
@@ -278,8 +280,6 @@ impl StudioApp {
                 // 기기 패널의 기본 왼쪽 포트 동기화
                 self.device_tab.selected_port =
                     opened.local_config.ports.left.clone().unwrap_or_default();
-                self.device_tab.selected_port =
-                    opened.local_config.ports.left.clone().unwrap_or_default();
                 // 프로젝트 설정 폼 동기화
                 self.settings_form.sync_from(&opened);
                 // 최근 프로젝트 목록 맨 앞에 추가 후 사용자 설정 저장
@@ -292,6 +292,8 @@ impl StudioApp {
                 self.sound_tab.history.reset();
                 self.canvas_history.reset(); // 스프라이트 편집 이력 초기화
                 self.canvas_drag_before = None;
+                self.shape_start = None;
+                self.editing_icon = false;
                 self.pending_confirm = None;
                 self.start_screen.error_message = None;
                 // 프로젝트 열기 직후 환경 점검(doctor)을 백그라운드로 자동 시작
@@ -327,6 +329,12 @@ impl StudioApp {
         self.sound_tab.history.reset(); // 효과음 편집 이력 초기화
         self.canvas_history.reset(); // 스프라이트 편집 이력 초기화
         self.canvas_drag_before = None;
+        self.shape_start = None;
+        self.editing_icon = false;
+        self.sprite_files.clear();
+        self.sound_files.clear();
+        self.font_files.clear();
+        self.has_icon = false;
         self.pending_confirm = None; // 확인 팝업 닫기
     }
 
@@ -360,15 +368,16 @@ impl StudioApp {
         }
     }
 
-    // OS 창 닫기(X) 버튼 클릭 시 미저장 탭 확인 및 마지막 창 크기 저장 처리
+    // OS 창 닫기(X) 버튼 클릭 시 미저장 탭 확인·실행 중 CLI 정리·창 크기 저장 처리
     fn handle_window_close(&mut self, ctx: &egui::Context) {
         // 창 닫기 요청이 없는 일반 프레임이면 즉시 반환
         if !ctx.input(|i| i.viewport().close_requested()) {
             return;
         }
 
-        // 확인 팝업에서 이미 종료를 승인한 경우 창 크기만 저장하고 종료 진행
+        // 확인 팝업에서 이미 종료를 승인한 경우 CLI 정리·창 크기 저장 후 종료 진행
         if self.allow_app_close {
+            self.stop_cli_command();
             self.save_window_size(ctx);
             return;
         }
@@ -380,6 +389,7 @@ impl StudioApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose); // 즉시 종료 취소
             self.pending_confirm = Some(PendingConfirm::App); // 종료 확인 팝업 표시
         } else {
+            self.stop_cli_command(); // 실행 중인 자식 프로세스 정리
             self.save_window_size(ctx); // 미저장 변경이 없으면 창 크기 저장 후 바로 종료
         }
     }
@@ -418,7 +428,7 @@ impl StudioApp {
 
         let width = self.editor.width();
         let height = self.editor.height();
-        let pixels = snapshot_canvas(&mut self.editor);
+        let pixels = snapshot_canvas(&self.editor);
 
         match save_sprite_png(&path, width, height, &pixels) {
             Ok(()) => {
@@ -430,7 +440,7 @@ impl StudioApp {
         }
     }
 
-    // assets/icon.png(16×16)를 열거나, 아직 없으면 16×16 빈 캔버스로 아이콘 편집 시작
+    // assets/icon.png(16×16 고정)를 열거나, 아직 없으면 16×16 빈 캔버스로 아이콘 편집 시작
     fn open_icon_png(&mut self) {
         let Some(assets_dir) = self.opened.as_ref().map(|o| o.project.assets_dir()) else {
             return;
@@ -440,17 +450,18 @@ impl StudioApp {
 
         if path.is_file() {
             match load_sprite_png(&path) {
-                Ok((w, h, pixels)) if (1..=32).contains(&w) && (1..=16).contains(&h) => {
-                    self.editor.resize(w, h);
-                    restore_canvas(&mut self.editor, &pixels);
+                Ok((16, 16, pixels)) => {
+                    self.editor.load_single_frame(16, 16, &pixels);
                     self.canvas_history.reset();
                     self.canvas_drag_before = None;
                     self.shape_start = None;
-                    self.sprite_io_status = format!("불러오기 완료: {} ({w}×{h})", path.display());
+                    self.anim_playing = false;
+                    self.anim_elapsed_ms = 0.0;
+                    self.sprite_io_status = format!("아이콘 불러오기 완료: {}", path.display());
                 }
                 Ok((w, h, _)) => {
                     self.sprite_io_status =
-                        format!("오류: 지원 크기(1×1 ~ 32×16)를 벗어났습니다 ({w}×{h}).");
+                        format!("오류: icon.png는 16×16 크기여야 합니다 ({w}×{h}).");
                 }
                 Err(err) => self.sprite_io_status = format!("오류: {err}"),
             }
@@ -459,6 +470,7 @@ impl StudioApp {
             self.editor.set_layout(ScreenLayout::Mirrored);
             self.canvas_history.reset();
             self.canvas_drag_before = None;
+            self.shape_start = None;
             self.sprite_io_status =
                 "새 icon.png (16×16) 편집 중 — Ctrl+S로 저장하세요.".to_string();
         }
@@ -531,7 +543,7 @@ impl StudioApp {
         }
     }
 
-    // <프로젝트>/assets/sprites/<이름>.png 를 불러와 캔버스에 반영
+    // <프로젝트>/assets/sprites/<이름>.png 를 불러와 캔버스에 반영 (1×1 ~ 32×16 지원)
     fn load_current_sprite(&mut self) {
         let Some(assets_dir) = self.opened.as_ref().map(|o| o.project.assets_dir()) else {
             return;
@@ -544,23 +556,19 @@ impl StudioApp {
 
         let path = assets_dir.join("sprites").join(format!("{name}.png"));
         match load_sprite_png(&path) {
-            Ok((32, 16, pixels)) => {
-                self.editor.set_layout(ScreenLayout::Wide);
-                restore_canvas(&mut self.editor, &pixels);
+            Ok((w, h, pixels)) if (1..=32).contains(&w) && (1..=16).contains(&h) => {
+                self.editing_icon = false;
+                self.editor.load_single_frame(w, h, &pixels);
                 self.canvas_history.reset();
                 self.canvas_drag_before = None;
-                self.sprite_io_status = format!("불러오기 완료: {}", path.display());
-            }
-            Ok((16, 16, pixels)) => {
-                self.editor.set_layout(ScreenLayout::Mirrored);
-                restore_canvas(&mut self.editor, &pixels);
-                self.canvas_history.reset();
-                self.canvas_drag_before = None;
-                self.sprite_io_status = format!("불러오기 완료: {}", path.display());
+                self.shape_start = None;
+                self.anim_playing = false;
+                self.anim_elapsed_ms = 0.0;
+                self.sprite_io_status = format!("불러오기 완료: {} ({w}×{h})", path.display());
             }
             Ok((w, h, _)) => {
                 self.sprite_io_status =
-                    format!("오류: 지원 크기(32×16, 16×16)가 아닙니다 ({w}×{h}).");
+                    format!("오류: 지원 크기(1×1 ~ 32×16)를 벗어났습니다 ({w}×{h}).");
             }
             Err(err) => self.sprite_io_status = format!("오류: {err}"),
         }
@@ -615,7 +623,7 @@ impl StudioApp {
         }
     }
 
-    // 전역 키보드 단축키(Ctrl+Z 실행 취소, Ctrl+Y 다시 실행, Ctrl+W 현재 탭 닫기) 처리
+    // 전역 키보드 단축키(Ctrl+S 저장, Ctrl+Z 실행 취소, Ctrl+Y 다시 실행, Ctrl+W 현재 탭 닫기) 처리
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         // Ctrl+S: 텍스트 입력칸 포커스 여부와 관계없이 현재 탭 즉시 저장
         let want_save =
@@ -779,6 +787,7 @@ impl StudioApp {
                                 if kind == TabKind::SpriteEditor {
                                     self.canvas_history.reset();
                                     self.canvas_drag_before = None;
+                                    self.shape_start = None;
                                 }
                                 self.tabs.close(kind);
                                 self.pending_confirm = None;
@@ -789,6 +798,7 @@ impl StudioApp {
                             PendingConfirm::App => {
                                 self.allow_app_close = true; // 다음 프레임 종료 허용
                                 self.pending_confirm = None; // 팝업 닫기
+                                self.stop_cli_command(); // 실행 중인 자식 프로세스 정리
                                 self.save_window_size(ctx); // 마지막 창 크기 저장
                                 ctx.send_viewport_cmd(egui::ViewportCommand::Close); // 앱 종료 실행
                             }
@@ -1186,6 +1196,8 @@ impl StudioApp {
         // 클릭한 에셋을 루프 종료 후 바로 열기 위한 임시 변수
         let mut open_sprite: Option<String> = None;
         let mut open_sound: Option<String> = None;
+        let mut open_font: Option<String> = None;
+        let mut open_icon = false;
 
         // 1) sprites/ 목록 (클릭 시 스프라이트 탭으로 바로 불러오기)
         egui::CollapsingHeader::new("sprites/")
@@ -1195,8 +1207,9 @@ impl StudioApp {
                     ui.colored_label(egui::Color32::from_gray(130), "  (비어 있음)");
                 } else {
                     for name in &self.sprite_files {
-                        let selected =
-                            active == TabKind::SpriteEditor && self.sprite_asset_name == *name;
+                        let selected = active == TabKind::SpriteEditor
+                            && !self.editing_icon
+                            && self.sprite_asset_name == *name;
                         if ui
                             .selectable_label(selected, format!("{name}.png"))
                             .clicked()
@@ -1226,9 +1239,6 @@ impl StudioApp {
                     }
                 }
             });
-
-        let mut open_font: Option<String> = None;
-        let mut open_icon = false;
 
         // 3) fonts/ 목록 (클릭 시 글꼴 탭으로 바로 불러오기)
         egui::CollapsingHeader::new("fonts/")
@@ -1264,6 +1274,8 @@ impl StudioApp {
         // 클릭된 에셋 파일 즉시 불러오기 및 해당 편집기 탭 활성화
         if let Some(name) = open_sprite {
             self.editing_icon = false;
+            self.anim_playing = false;
+            self.anim_elapsed_ms = 0.0;
             self.sprite_asset_name = name;
             self.load_current_sprite();
             self.tabs.open(TabKind::SpriteEditor);
@@ -1663,7 +1675,12 @@ impl StudioApp {
         // 1줄: 화면 모드 전환 · 전체 지우기 · 실행 취소/다시 실행
         ui.horizontal(|ui| {
             ui.label("화면 모드:");
-            let is_wide = matches!(self.editor.layout(), ScreenLayout::Wide);
+            let is_wide = matches!(self.editor.layout(), ScreenLayout::Wide)
+                && self.editor.width() == 32
+                && self.editor.height() == 16;
+            let is_mirrored = matches!(self.editor.layout(), ScreenLayout::Mirrored)
+                && self.editor.width() == 16
+                && self.editor.height() == 16;
 
             if ui.selectable_label(is_wide, "Wide (32×16)").clicked() && !is_wide {
                 self.editing_icon = false;
@@ -1672,7 +1689,11 @@ impl StudioApp {
                 self.canvas_drag_before = None;
                 self.shape_start = None;
             }
-            if ui.selectable_label(!is_wide, "Mirrored (16×16)").clicked() && is_wide {
+            if ui
+                .selectable_label(is_mirrored, "Mirrored (16×16)")
+                .clicked()
+                && !is_mirrored
+            {
                 self.editor.set_layout(ScreenLayout::Mirrored);
                 self.canvas_history.reset();
                 self.canvas_drag_before = None;
@@ -1682,9 +1703,9 @@ impl StudioApp {
             ui.separator();
 
             if ui.button("전체 지우기").clicked() {
-                let before = snapshot_canvas(&mut self.editor);
+                let before = self.editor.snapshot_state();
                 self.editor.clear();
-                let after = snapshot_canvas(&mut self.editor);
+                let after = self.editor.snapshot_state();
                 if before != after {
                     let cmd = Box::new(ReplaceCanvasCommand::new(before, after));
                     self.canvas_history.execute(&mut self.editor, cmd);
@@ -1825,7 +1846,7 @@ impl StudioApp {
         });
     }
 
-    // 32×16 (또는 16×16) 도트 캔버스 렌더링 및 마우스 입력 처리
+    // 1×1 ~ 32×16 도트 캔버스 렌더링 및 마우스 입력 처리
     fn show_canvas(&mut self, ui: &mut egui::Ui) {
         let width = self.editor.width(); // 가로 도트 수
         let height = self.editor.height(); // 세로 도트 수
@@ -1842,6 +1863,8 @@ impl StudioApp {
         if (primary_active || secondary_active)
             && let Some(pointer_pos) = response.interact_pointer_pos()
         {
+            self.anim_playing = false;
+
             let rel = pointer_pos - rect.min;
             if rel.x >= 0.0 && rel.y >= 0.0 {
                 let x = (rel.x / CELL_SIZE) as usize;
@@ -1849,22 +1872,20 @@ impl StudioApp {
                 if x < width && y < height {
                     if secondary_active {
                         if self.canvas_drag_before.is_none() {
-                            self.canvas_drag_before = Some(snapshot_canvas(&mut self.editor));
+                            self.canvas_drag_before = Some(self.editor.snapshot_state());
                         }
                         self.editor.erase_pixel(x, y);
                     } else {
                         match self.draw_tool {
                             DrawTool::Pencil => {
                                 if self.canvas_drag_before.is_none() {
-                                    self.canvas_drag_before =
-                                        Some(snapshot_canvas(&mut self.editor));
+                                    self.canvas_drag_before = Some(self.editor.snapshot_state());
                                 }
                                 self.editor.paint_pixel(x, y);
                             }
                             DrawTool::Eraser => {
                                 if self.canvas_drag_before.is_none() {
-                                    self.canvas_drag_before =
-                                        Some(snapshot_canvas(&mut self.editor));
+                                    self.canvas_drag_before = Some(self.editor.snapshot_state());
                                 }
                                 self.editor.erase_pixel(x, y);
                             }
@@ -1874,9 +1895,9 @@ impl StudioApp {
                             }
                             DrawTool::Fill => {
                                 if primary_clicked {
-                                    let before = snapshot_canvas(&mut self.editor);
+                                    let before = self.editor.snapshot_state();
                                     self.editor.flood_fill(x, y);
-                                    let after = snapshot_canvas(&mut self.editor);
+                                    let after = self.editor.snapshot_state();
                                     if before != after {
                                         let cmd =
                                             Box::new(ReplaceCanvasCommand::new(before, after));
@@ -1887,14 +1908,13 @@ impl StudioApp {
                             DrawTool::Line | DrawTool::Rect => {
                                 if self.shape_start.is_none() {
                                     self.shape_start = Some((x, y));
-                                    self.canvas_drag_before =
-                                        Some(snapshot_canvas(&mut self.editor));
+                                    self.canvas_drag_before = Some(self.editor.snapshot_state());
                                 }
                                 // 드래그 중에는 원본 스냅샷 위에 실시간으로 도형 미리보기
                                 if let (Some((sx, sy)), Some(before)) =
                                     (self.shape_start, self.canvas_drag_before.as_ref())
                                 {
-                                    restore_canvas(&mut self.editor, before);
+                                    self.editor.restore_state(before);
                                     if self.draw_tool == DrawTool::Line {
                                         self.editor.draw_line(sx, sy, x, y);
                                     } else {
@@ -1913,7 +1933,7 @@ impl StudioApp {
         if stroke_finished {
             self.shape_start = None;
             if let Some(before) = self.canvas_drag_before.take() {
-                let after = snapshot_canvas(&mut self.editor);
+                let after = self.editor.snapshot_state();
                 if before != after {
                     let cmd = Box::new(ReplaceCanvasCommand::new(before, after));
                     self.canvas_history.execute(&mut self.editor, cmd);
@@ -1945,15 +1965,162 @@ impl StudioApp {
             }
         }
 
-        // Wide(32×16) 모드일 때 중앙(x=16) 패널 경계선 표시
+        // 가로가 16px을 넘을 때 중앙(x=16) 패널 경계선 표시
         if width > usize::from(PANEL_WIDTH) {
             draw_panel_divider(painter, rect);
         }
     }
 
+    // 스프라이트 애니메이션 프레임 관리(추가·복제·삭제·순서·시간) 및 재생 미리보기 바
+    fn show_animation_bar(&mut self, ui: &mut egui::Ui) {
+        // 아이콘 편집 모드(16×16 정지 이미지)에서는 애니메이션 바 숨김
+        if self.editing_icon {
+            return;
+        }
+
+        // 재생 중이면 프레임별 duration_ms에 맞춰 다음 프레임으로 자동 전환
+        if self.anim_playing && self.editor.frame_count() > 1 {
+            let dt_ms = ui.ctx().input(|i| i.stable_dt) * 1000.0;
+            self.anim_elapsed_ms += dt_ms;
+            let current_dur = f32::from(
+                self.editor
+                    .frame_duration_ms(self.editor.current_frame_index()),
+            );
+            if self.anim_elapsed_ms >= current_dur {
+                self.anim_elapsed_ms %= current_dur.max(1.0);
+                let next = (self.editor.current_frame_index() + 1) % self.editor.frame_count();
+                self.editor.select_frame(next);
+            }
+            ui.ctx().request_repaint(); // 부드러운 재생을 위해 다음 프레임 요청
+        } else {
+            self.anim_playing = false;
+            self.anim_elapsed_ms = 0.0;
+        }
+
+        let count = self.editor.frame_count();
+        let current = self.editor.current_frame_index();
+
+        // 1줄: 재생·추가·복제·순서 이동·삭제·프레임 시간 조절
+        ui.horizontal(|ui| {
+            ui.strong(format!("애니메이션 ({}/{count})", current + 1));
+
+            let play_label = if self.anim_playing {
+                "■ 정지"
+            } else {
+                "▶ 재생"
+            };
+            if ui
+                .add_enabled(count > 1, egui::Button::new(play_label))
+                .clicked()
+            {
+                self.anim_playing = !self.anim_playing;
+                self.anim_elapsed_ms = 0.0;
+            }
+
+            ui.separator();
+
+            if ui.button("+ 빈 프레임").clicked() {
+                self.anim_playing = false;
+                let before = self.editor.snapshot_state();
+                self.editor.add_frame();
+                let after = self.editor.snapshot_state();
+                self.canvas_history.execute(
+                    &mut self.editor,
+                    Box::new(ReplaceCanvasCommand::new(before, after)),
+                );
+            }
+            if ui.button("복제").clicked() {
+                self.anim_playing = false;
+                let before = self.editor.snapshot_state();
+                self.editor.duplicate_frame();
+                let after = self.editor.snapshot_state();
+                self.canvas_history.execute(
+                    &mut self.editor,
+                    Box::new(ReplaceCanvasCommand::new(before, after)),
+                );
+            }
+            if ui
+                .add_enabled(current > 0, egui::Button::new("◀"))
+                .on_hover_text("프레임 앞으로 이동")
+                .clicked()
+            {
+                self.anim_playing = false;
+                let before = self.editor.snapshot_state();
+                if self.editor.move_frame_left(current) {
+                    let after = self.editor.snapshot_state();
+                    self.canvas_history.execute(
+                        &mut self.editor,
+                        Box::new(ReplaceCanvasCommand::new(before, after)),
+                    );
+                }
+            }
+            if ui
+                .add_enabled(current + 1 < count, egui::Button::new("▶"))
+                .on_hover_text("프레임 뒤로 이동")
+                .clicked()
+            {
+                self.anim_playing = false;
+                let before = self.editor.snapshot_state();
+                if self.editor.move_frame_right(current) {
+                    let after = self.editor.snapshot_state();
+                    self.canvas_history.execute(
+                        &mut self.editor,
+                        Box::new(ReplaceCanvasCommand::new(before, after)),
+                    );
+                }
+            }
+            if ui
+                .add_enabled(count > 1, egui::Button::new("삭제"))
+                .clicked()
+            {
+                self.anim_playing = false;
+                let before = self.editor.snapshot_state();
+                if self.editor.delete_frame(current) {
+                    let after = self.editor.snapshot_state();
+                    self.canvas_history.execute(
+                        &mut self.editor,
+                        Box::new(ReplaceCanvasCommand::new(before, after)),
+                    );
+                }
+            }
+
+            ui.separator();
+
+            // 현재 프레임 재생 시간(ms) 편집
+            ui.label("시간:");
+            let mut dur = self.editor.frame_duration_ms(current);
+            let before = self.editor.snapshot_state();
+            if ui
+                .add(egui::DragValue::new(&mut dur).range(20..=5000).suffix("ms"))
+                .changed()
+            {
+                self.editor.set_frame_duration_ms(current, dur);
+                let after = self.editor.snapshot_state();
+                if before != after {
+                    self.canvas_history.execute(
+                        &mut self.editor,
+                        Box::new(ReplaceCanvasCommand::new(before, after)),
+                    );
+                }
+            }
+        });
+
+        // 2줄: 프레임 선택 버튼 목록 (#1, #2, ...)
+        ui.horizontal_wrapped(|ui| {
+            for idx in 0..count {
+                let dur = self.editor.frame_duration_ms(idx);
+                let label = format!("#{} ({dur}ms)", idx + 1);
+                if ui.selectable_label(idx == current, label).clicked() {
+                    self.anim_playing = false;
+                    self.editor.select_frame(idx);
+                }
+            }
+        });
+    }
+
     // 글꼴 변환과 미리보기 탭 화면
     fn show_font_tab(&mut self, ui: &mut egui::Ui) {
-        // 글꼴 파일 저장·불러오기 바 (assets/fonts/<이름>.font.toml)
+        // 1) 글꼴 설정 파일 저장·불러오기 바 (assets/fonts/<이름>.font.toml)
         ui.horizontal(|ui| {
             ui.label("파일명 (fonts/*.font.toml):");
             ui.add(
@@ -1971,6 +2138,27 @@ impl StudioApp {
                 ui.label(&self.font_tab.io_status);
             }
         });
+
+        // 2) 원본 TTF/OTF 폰트 경로 입력 및 불러오기
+        ui.horizontal(|ui| {
+            ui.label("TTF/OTF 경로:");
+            ui.add(egui::TextEdit::singleline(&mut self.font_tab.font_path).desired_width(280.0));
+            if ui.button("폰트 불러오기").clicked() {
+                match FontConverter::from_file(Path::new(&self.font_tab.font_path)) {
+                    Ok(converter) => {
+                        self.font_tab.converter = Some(converter);
+                        self.font_tab.status_message = "폰트 불러오기 완료!".to_string();
+                    }
+                    Err(err) => {
+                        self.font_tab.converter = None;
+                        self.font_tab.status_message = err;
+                    }
+                }
+            }
+        });
+        ui.label(&self.font_tab.status_message);
+
+        // 3) 라이선스 · 픽셀 크기 · 임계값 · 문자 집합 설정
         ui.horizontal(|ui| {
             ui.label("라이선스:");
             ui.add(
@@ -2406,7 +2594,7 @@ fn to_color32(color: Rgb) -> egui::Color32 {
 // 매 프레임 화면을 갱신하는 egui 루프
 impl eframe::App for StudioApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        // OS 창 닫기(X) 요청 감지: 미저장 탭 확인 및 마지막 창 크기 저장
+        // OS 창 닫기(X) 요청 감지: 미저장 탭 확인·CLI 정리·마지막 창 크기 저장
         self.handle_window_close(ui.ctx());
         // 백그라운드 작업(doctor, CLI) 완료 여부 매 프레임 확인
         self.poll_background_tasks(ui.ctx());
@@ -2419,7 +2607,7 @@ impl eframe::App for StudioApp {
             return;
         }
 
-        // 전역 단축키(Ctrl+Z / Ctrl+Y) 입력 처리
+        // 전역 단축키(Ctrl+S / Ctrl+Z / Ctrl+Y / Ctrl+W) 입력 처리
         self.handle_shortcuts(ui.ctx());
 
         // 1) 상단 도구 모음 패널
@@ -2459,14 +2647,16 @@ impl eframe::App for StudioApp {
                 TabKind::Overview => self.show_overview_tab(ui), // 프로젝트 개요 탭
                 TabKind::ProjectSettings => self.show_project_settings_tab(ui), // 프로젝트 설정 탭
                 TabKind::SpriteEditor => {
-                    self.show_sprite_toolbar(ui); // 화면 모드·초기화 도구 모음
+                    self.show_sprite_toolbar(ui); // 화면 모드·크기·도구·파일 저장 바
                     ui.add_space(6.0);
                     self.show_palette(ui); // 색상 팔레트 및 컬러 피커
                     ui.add_space(10.0);
                     self.show_canvas(ui); // 도트 캔버스
                     ui.add_space(8.0);
+                    self.show_animation_bar(ui); // 애니메이션 프레임 타임라인 및 재생
+                    ui.add_space(6.0);
                     ui.label(
-                        "조작: 마우스 왼쪽 클릭/드래그 = 픽셀 찍기 | 오른쪽 클릭/드래그 = 지우기",
+                        "조작: 마우스 왼쪽 클릭/드래그 = 선택 도구 사용 | 오른쪽 클릭/드래그 = 빠른 지우기",
                     );
                 }
                 TabKind::FontTool => self.show_font_tab(ui), // 글꼴 변환·미리보기 탭

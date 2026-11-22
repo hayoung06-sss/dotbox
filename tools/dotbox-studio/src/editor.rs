@@ -13,6 +13,9 @@ pub const PALETTE: [Rgb; 8] = [
     Rgb::new(210, 80, 255), // 보라
 ];
 
+// 기본 프레임 재생 시간 (ms)
+const DEFAULT_FRAME_MS: u16 = 100;
+
 // 스프라이트 편집기 그리기 도구 종류
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DrawTool {
@@ -39,12 +42,30 @@ impl DrawTool {
     }
 }
 
-// GUI 없이 독립적으로 테스트할 수 있는 캔버스 편집기 상태
+// 애니메이션의 단일 프레임 데이터 (픽셀 배열 + 재생 시간)
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpriteFrame {
+    pub pixels: Vec<Rgb>, // width * height 크기의 RGB 픽셀
+    pub duration_ms: u16, // 이 프레임이 표시되는 시간 (ms)
+}
+
+// Undo/Redo를 위해 스프라이트 전체 상태(크기·모든 프레임·선택 인덱스)를 보관하는 스냅샷
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpriteSnapshot {
+    pub width: usize,
+    pub height: usize,
+    pub frames: Vec<SpriteFrame>,
+    pub current_frame: usize,
+}
+
+// GUI 없이 독립적으로 테스트할 수 있는 캔버스·애니메이션 편집기 상태
 pub struct CanvasEditor {
-    framebuffer: FrameBuffer, // 엔진 프레임버퍼 (미리보기 일치 보장)
+    framebuffer: FrameBuffer, // 현재 활성 프레임의 엔진 프레임버퍼 (미리보기 일치 보장)
     layout: ScreenLayout,     // 현재 내부 레이아웃 (Wide 32x16 / Mirrored 16x16)
     canvas_width: usize,      // 실제 편집 중인 가로 크기 (1~32)
     canvas_height: usize,     // 실제 편집 중인 세로 크기 (1~16)
+    frames: Vec<SpriteFrame>, // 애니메이션 프레임 목록 (항상 1개 이상 유지)
+    current_frame: usize,     // 현재 편집 중인 프레임 인덱스
     selected_color: Rgb,      // 현재 선택된 브러시 색상
     led_preview: bool,        // 실기기 LED 밝기 미리보기 켜기/끄기
     brightness_percent: u8,   // 실기기 밝기 제한 시뮬레이션 (15~25%)
@@ -57,13 +78,18 @@ impl Default for CanvasEditor {
 }
 
 impl CanvasEditor {
-    // 기본값으로 편집기 생성 (32x16, 빨간색 브러시, 밝기 20%)
+    // 기본값으로 편집기 생성 (32x16, 1프레임, 빨간색 브러시, 밝기 20%)
     pub fn new() -> Self {
         Self {
             framebuffer: FrameBuffer::new(ScreenLayout::Wide),
             layout: ScreenLayout::Wide,
             canvas_width: 32,
             canvas_height: 16,
+            frames: vec![SpriteFrame {
+                pixels: vec![Rgb::BLACK; 32 * 16],
+                duration_ms: DEFAULT_FRAME_MS,
+            }],
+            current_frame: 0,
             selected_color: PALETTE[1],
             led_preview: false,
             brightness_percent: 20,
@@ -95,11 +121,6 @@ impl CanvasEditor {
         self.selected_color = color;
     }
 
-    // 실기기 밝기 미리보기 활성화 여부 반환
-    pub fn led_preview(&self) -> bool {
-        self.led_preview
-    }
-
     // 실기기 밝기 미리보기 켜기/끄기 설정
     pub fn set_led_preview(&mut self, enabled: bool) {
         self.led_preview = enabled;
@@ -110,30 +131,236 @@ impl CanvasEditor {
         self.brightness_percent = percent.clamp(15, 25);
     }
 
-    // 화면 모드 변경 시 새 레이아웃 크기로 프레임버퍼 초기화
+    // 현재 프레임버퍼 내용을 frames[current_frame]에 동기화
+    fn sync_to_current_frame(&mut self) {
+        let mut pixels = Vec::with_capacity(self.canvas_width * self.canvas_height);
+        for y in 0..self.canvas_height {
+            for x in 0..self.canvas_width {
+                pixels.push(self.pixel(x, y));
+            }
+        }
+        if let Some(frame) = self.frames.get_mut(self.current_frame) {
+            frame.pixels = pixels;
+        }
+    }
+
+    // frames[current_frame]의 픽셀을 엔진 프레임버퍼로 불러오기
+    fn load_current_frame_to_fb(&mut self) {
+        self.framebuffer.clear();
+        let Some(frame) = self.frames.get(self.current_frame) else {
+            return;
+        };
+        for y in 0..self.canvas_height {
+            for x in 0..self.canvas_width {
+                let idx = y * self.canvas_width + x;
+                if let Some(&color) = frame.pixels.get(idx)
+                    && let (Ok(ix), Ok(iy)) = (i32::try_from(x), i32::try_from(y))
+                {
+                    self.framebuffer.set_pixel(ix, iy, color);
+                }
+            }
+        }
+    }
+
+    // 전체 프레임 개수 반환
+    pub fn frame_count(&self) -> usize {
+        self.frames.len()
+    }
+
+    // 현재 선택된 프레임 인덱스 반환 (0부터 시작)
+    pub fn current_frame_index(&self) -> usize {
+        self.current_frame
+    }
+
+    // 지정한 프레임의 재생 시간(ms) 조회
+    pub fn frame_duration_ms(&self, index: usize) -> u16 {
+        self.frames
+            .get(index)
+            .map(|f| f.duration_ms)
+            .unwrap_or(DEFAULT_FRAME_MS)
+    }
+
+    // 지정한 프레임의 재생 시간(ms) 변경 (20~5000ms 범위 제한)
+    pub fn set_frame_duration_ms(&mut self, index: usize, ms: u16) {
+        if let Some(frame) = self.frames.get_mut(index) {
+            frame.duration_ms = ms.clamp(20, 5000);
+        }
+    }
+
+    // 지정한 인덱스의 프레임으로 전환
+    pub fn select_frame(&mut self, index: usize) {
+        if index < self.frames.len() && index != self.current_frame {
+            self.sync_to_current_frame();
+            self.current_frame = index;
+            self.load_current_frame_to_fb();
+        }
+    }
+
+    // 현재 프레임 뒤에 빈 프레임 1개를 추가하고 선택
+    pub fn add_frame(&mut self) {
+        self.sync_to_current_frame();
+        let insert_at = self.current_frame + 1;
+        self.frames.insert(
+            insert_at,
+            SpriteFrame {
+                pixels: vec![Rgb::BLACK; self.canvas_width * self.canvas_height],
+                duration_ms: DEFAULT_FRAME_MS,
+            },
+        );
+        self.current_frame = insert_at;
+        self.load_current_frame_to_fb();
+    }
+
+    // 현재 프레임을 복제해 바로 뒤에 삽입하고 선택
+    pub fn duplicate_frame(&mut self) {
+        self.sync_to_current_frame();
+        let copy = self.frames[self.current_frame].clone();
+        let insert_at = self.current_frame + 1;
+        self.frames.insert(insert_at, copy);
+        self.current_frame = insert_at;
+        self.load_current_frame_to_fb();
+    }
+
+    // 지정한 프레임 삭제 (최소 1프레임은 유지)
+    pub fn delete_frame(&mut self, index: usize) -> bool {
+        if self.frames.len() <= 1 || index >= self.frames.len() {
+            return false;
+        }
+        self.sync_to_current_frame();
+        self.frames.remove(index);
+        if self.current_frame >= self.frames.len() {
+            self.current_frame = self.frames.len() - 1;
+        } else if index < self.current_frame {
+            self.current_frame -= 1;
+        }
+        self.load_current_frame_to_fb();
+        true
+    }
+
+    // 지정한 프레임을 왼쪽(앞)으로 한 칸 이동
+    pub fn move_frame_left(&mut self, index: usize) -> bool {
+        if index == 0 || index >= self.frames.len() {
+            return false;
+        }
+        self.sync_to_current_frame();
+        self.frames.swap(index, index - 1);
+        if self.current_frame == index {
+            self.current_frame = index - 1;
+        } else if self.current_frame == index - 1 {
+            self.current_frame = index;
+        }
+        self.load_current_frame_to_fb();
+        true
+    }
+
+    // 지정한 프레임을 오른쪽(뒤)으로 한 칸 이동
+    pub fn move_frame_right(&mut self, index: usize) -> bool {
+        if index + 1 >= self.frames.len() {
+            return false;
+        }
+        self.sync_to_current_frame();
+        self.frames.swap(index, index + 1);
+        if self.current_frame == index {
+            self.current_frame = index + 1;
+        } else if self.current_frame == index + 1 {
+            self.current_frame = index;
+        }
+        self.load_current_frame_to_fb();
+        true
+    }
+
+    // Undo/Redo용 전체 스프라이트 상태 스냅샷 추출
+    pub fn snapshot_state(&mut self) -> SpriteSnapshot {
+        self.sync_to_current_frame();
+        SpriteSnapshot {
+            width: self.canvas_width,
+            height: self.canvas_height,
+            frames: self.frames.clone(),
+            current_frame: self.current_frame,
+        }
+    }
+
+    // Undo/Redo용 전체 스프라이트 상태 스냅샷 복원
+    pub fn restore_state(&mut self, state: &SpriteSnapshot) {
+        let w = state.width.clamp(1, 32);
+        let h = state.height.clamp(1, 16);
+        self.layout = if w <= 16 {
+            ScreenLayout::Mirrored
+        } else {
+            ScreenLayout::Wide
+        };
+        self.framebuffer = FrameBuffer::new(self.layout);
+        self.canvas_width = w;
+        self.canvas_height = h;
+        self.frames = if state.frames.is_empty() {
+            vec![SpriteFrame {
+                pixels: vec![Rgb::BLACK; w * h],
+                duration_ms: DEFAULT_FRAME_MS,
+            }]
+        } else {
+            state.frames.clone()
+        };
+        self.current_frame = state.current_frame.min(self.frames.len() - 1);
+        self.load_current_frame_to_fb();
+    }
+
+    // 단일 PNG 이미지를 불러와 1프레임 상태로 초기화
+    pub fn load_single_frame(&mut self, width: usize, height: usize, pixels: &[Rgb]) {
+        let w = width.clamp(1, 32);
+        let h = height.clamp(1, 16);
+        self.layout = if w <= 16 {
+            ScreenLayout::Mirrored
+        } else {
+            ScreenLayout::Wide
+        };
+        self.framebuffer = FrameBuffer::new(self.layout);
+        self.canvas_width = w;
+        self.canvas_height = h;
+
+        let mut frame_pixels = vec![Rgb::BLACK; w * h];
+        for (dst, &src) in frame_pixels.iter_mut().zip(pixels.iter()) {
+            *dst = src;
+        }
+        self.frames = vec![SpriteFrame {
+            pixels: frame_pixels,
+            duration_ms: DEFAULT_FRAME_MS,
+        }];
+        self.current_frame = 0;
+        self.load_current_frame_to_fb();
+    }
+
+    // 화면 모드 변경 시 새 레이아웃 크기의 빈 1프레임으로 초기화
     pub fn set_layout(&mut self, layout: ScreenLayout) {
         self.layout = layout;
         self.framebuffer = FrameBuffer::new(layout);
         self.canvas_width = usize::from(self.framebuffer.width());
         self.canvas_height = usize::from(self.framebuffer.height());
+        self.frames = vec![SpriteFrame {
+            pixels: vec![Rgb::BLACK; self.canvas_width * self.canvas_height],
+            duration_ms: DEFAULT_FRAME_MS,
+        }];
+        self.current_frame = 0;
     }
 
-    // 캔버스 크기를 1×1 ~ 32×16 범위로 변경 (기존 픽셀은 겹치는 영역만큼 유지)
+    // 캔버스 크기를 1×1 ~ 32×16 범위로 변경 (모든 프레임의 겹치는 픽셀 유지)
     pub fn resize(&mut self, width: usize, height: usize) {
+        self.sync_to_current_frame();
         let new_w = width.clamp(1, 32);
         let new_h = height.clamp(1, 16);
         let old_w = self.canvas_width;
         let old_h = self.canvas_height;
 
-        // 기존 픽셀 백업
-        let mut old_pixels = Vec::with_capacity(old_w * old_h);
-        for y in 0..old_h {
-            for x in 0..old_w {
-                old_pixels.push(self.pixel(x, y));
+        // 모든 프레임을 새 크기에 맞게 조정
+        for frame in &mut self.frames {
+            let mut resized = vec![Rgb::BLACK; new_w * new_h];
+            for y in 0..old_h.min(new_h) {
+                for x in 0..old_w.min(new_w) {
+                    resized[y * new_w + x] = frame.pixels[y * old_w + x];
+                }
             }
+            frame.pixels = resized;
         }
 
-        // 새 크기에 맞는 최소 레이아웃으로 프레임버퍼 재구성
         self.layout = if new_w <= 16 {
             ScreenLayout::Mirrored
         } else {
@@ -142,16 +369,7 @@ impl CanvasEditor {
         self.framebuffer = FrameBuffer::new(self.layout);
         self.canvas_width = new_w;
         self.canvas_height = new_h;
-
-        // 겹치는 영역의 기존 픽셀 복원
-        for y in 0..old_h.min(new_h) {
-            for x in 0..old_w.min(new_w) {
-                let color = old_pixels[y * old_w + x];
-                if let (Ok(ix), Ok(iy)) = (i32::try_from(x), i32::try_from(y)) {
-                    self.framebuffer.set_pixel(ix, iy, color);
-                }
-            }
-        }
+        self.load_current_frame_to_fb();
     }
 
     // 지정한 좌표(x, y)에 현재 선택된 색으로 픽셀 찍기
@@ -262,7 +480,7 @@ impl CanvasEditor {
         }
     }
 
-    // 캔버스 전체를 검은색으로 초기화
+    // 현재 프레임 전체를 검은색으로 초기화
     pub fn clear(&mut self) {
         self.framebuffer.clear();
     }
@@ -298,7 +516,7 @@ pub fn scale_brightness(color: Rgb, percent: u8) -> Rgb {
     )
 }
 
-// GUI 창 없이 편집 로직만 검증하는 단위 테스트
+// GUI 창 없이 편집·애니메이션 프레임 로직을 검증하는 단위 테스트
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -346,7 +564,6 @@ mod tests {
         assert_eq!((editor.width(), editor.height()), (8, 8));
         assert_eq!(editor.pixel(2, 3), green);
 
-        // 범위 밖 크기는 1~32, 1~16으로 보정
         editor.resize(0, 99);
         assert_eq!((editor.width(), editor.height()), (1, 16));
     }
@@ -358,17 +575,15 @@ mod tests {
         let white = Rgb::WHITE;
         let blue = Rgb::new(0, 0, 255);
 
-        // x=2 세로선으로 좌/우 분리
         editor.set_selected_color(white);
         editor.draw_line(2, 0, 2, 4);
 
-        // 왼쪽 영역(0, 0)만 파란색으로 채우기
         editor.set_selected_color(blue);
         editor.flood_fill(0, 0);
 
-        assert_eq!(editor.pixel(1, 2), blue); // 왼쪽은 채워짐
-        assert_eq!(editor.pixel(2, 2), white); // 경계선은 유지
-        assert_eq!(editor.pixel(3, 2), Rgb::BLACK); // 오른쪽은 그대로
+        assert_eq!(editor.pixel(1, 2), blue);
+        assert_eq!(editor.pixel(2, 2), white);
+        assert_eq!(editor.pixel(3, 2), Rgb::BLACK);
     }
 
     #[test]
@@ -379,13 +594,50 @@ mod tests {
         editor.set_selected_color(yellow);
         editor.draw_rect(1, 1, 4, 4);
 
-        assert_eq!(editor.pixel(1, 1), yellow); // 모서리
-        assert_eq!(editor.pixel(2, 2), Rgb::BLACK); // 내부는 비어 있음
+        assert_eq!(editor.pixel(1, 1), yellow);
+        assert_eq!(editor.pixel(2, 2), Rgb::BLACK);
 
         editor.set_selected_color(Rgb::WHITE);
         let picked = editor.pick_color(4, 4);
         assert_eq!(picked, yellow);
         assert_eq!(editor.selected_color(), yellow);
+    }
+
+    // 애니메이션 프레임 추가·복제·전환·순서 이동·삭제·시간 설정 검증
+    #[test]
+    fn animation_frames_add_switch_reorder_and_delete() {
+        let mut editor = CanvasEditor::new();
+        editor.resize(4, 4);
+        let red = Rgb::new(255, 0, 0);
+        let blue = Rgb::new(0, 0, 255);
+
+        // 0번 프레임에 빨간 점 찍기
+        editor.set_selected_color(red);
+        editor.paint_pixel(0, 0);
+        editor.set_frame_duration_ms(0, 150);
+
+        // 1번 빈 프레임 추가 후 파란 점 찍기
+        editor.add_frame();
+        assert_eq!(editor.frame_count(), 2);
+        assert_eq!(editor.current_frame_index(), 1);
+        assert_eq!(editor.pixel(0, 0), Rgb::BLACK);
+        editor.set_selected_color(blue);
+        editor.paint_pixel(1, 1);
+
+        // 0번 프레임으로 돌아오면 빨간 점과 시간(150ms)이 유지되어야 함
+        editor.select_frame(0);
+        assert_eq!(editor.pixel(0, 0), red);
+        assert_eq!(editor.frame_duration_ms(0), 150);
+
+        // 0번 프레임을 오른쪽(1번)으로 이동
+        assert!(editor.move_frame_right(0));
+        assert_eq!(editor.current_frame_index(), 1);
+        assert_eq!(editor.pixel(0, 0), red);
+
+        // 0번(파란 점) 삭제 후 1프레임만 남으면 추가 삭제는 거부되어야 함
+        assert!(editor.delete_frame(0));
+        assert_eq!(editor.frame_count(), 1);
+        assert!(!editor.delete_frame(0));
     }
 
     #[test]
