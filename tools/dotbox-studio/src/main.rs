@@ -2010,42 +2010,69 @@ impl StudioApp {
         }
     }
 
-    // 개요 탭 화면 (명세서 4.2)
+    // 개요 탭 화면 (명세서 4.2) — 표 정렬 및 상태별 분류로 가독성 개선
     fn show_overview_tab(&mut self, ui: &mut egui::Ui) {
         let Some(opened) = self.opened.clone() else {
             return;
         };
 
+        // 섹션 공통 프레임 (순백색 카드 + 1px 연회색 테두리 + 4px 모서리)
+        let section_frame = egui::Frame::default()
+            .fill(egui::Color32::WHITE)
+            .stroke(egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgb(218, 218, 224),
+            ))
+            .corner_radius(egui::CornerRadius::same(4))
+            .inner_margin(egui::Margin::same(14));
+        let label_color = egui::Color32::from_rgb(110, 110, 115); // 보조 라벨 (#6E6E73)
+
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.heading("프로젝트 개요");
             ui.separator();
-
-            // 1) dotbox.toml 기본 정보 및 [paths]
-            egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.strong("프로젝트 정보 (dotbox.toml)");
-                ui.label(format!("이름: {}", opened.project.name()));
-                ui.label(format!("경로: {}", opened.project.root().display()));
-                let paths = &opened.project.manifest().paths;
-                ui.label(format!(
-                    "[paths] game: {} | sim: {} | firmware: {} | assets: {}",
-                    paths.game.display(),
-                    paths.sim.display(),
-                    paths.firmware.display(),
-                    paths.assets.display()
-                ));
-                ui.label(format!(
-                    "펌웨어 포함: {}",
-                    if opened.project.has_firmware() {
-                        "예"
-                    } else {
-                        "아니오"
-                    }
-                ));
-            });
             ui.add_space(6.0);
 
-            // 2) 엔진 버전 일치 여부 및 doctor::run 환경 점검 요약
-            egui::Frame::group(ui.style()).show(ui, |ui| {
+            // 1) dotbox.toml 기본 정보 및 [paths] — 2열 Grid 표로 정렬
+            section_frame.show(ui, |ui| {
+                ui.strong("프로젝트 정보 (dotbox.toml)");
+                ui.add_space(6.0);
+
+                let paths = &opened.project.manifest().paths;
+                egui::Grid::new("overview_project_info_grid")
+                    .num_columns(2)
+                    .spacing([18.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.colored_label(label_color, "프로젝트 이름");
+                        ui.strong(opened.project.name());
+                        ui.end_row();
+
+                        ui.colored_label(label_color, "프로젝트 경로");
+                        ui.monospace(opened.project.root().display().to_string());
+                        ui.end_row();
+
+                        ui.colored_label(label_color, "펌웨어 포함");
+                        ui.label(if opened.project.has_firmware() {
+                            "예 (ESP32 포함)"
+                        } else {
+                            "아니오 (시뮬레이터 전용)"
+                        });
+                        ui.end_row();
+
+                        ui.colored_label(label_color, "하위 폴더 구조");
+                        ui.monospace(format!(
+                            "game: {}  /  sim: {}  /  firmware: {}  /  assets: {}",
+                            paths.game.display(),
+                            paths.sim.display(),
+                            paths.firmware.display(),
+                            paths.assets.display()
+                        ));
+                        ui.end_row();
+                    });
+            });
+            ui.add_space(8.0);
+
+            // 2) 환경 점검 (dotbox doctor) — 오류·경고만 상단에 기본 노출, 정상·정보는 접기
+            section_frame.show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.strong("환경 점검 (dotbox doctor)");
                     ui.checkbox(&mut self.doctor_host_only, "시뮬레이터 전용(host-only)");
@@ -2057,95 +2084,198 @@ impl StudioApp {
                         self.start_doctor_check();
                     }
                     if busy {
-                        ui.label("점검 중...");
+                        ui.colored_label(label_color, "점검 중...");
                     }
                 });
+                ui.add_space(6.0);
 
                 if let Some(report) = &self.doctor_report {
-                    // engine.version 항목 별도 강조 표시
+                    // engine.version 항목 별도 표시
                     if let Some(engine_check) =
                         report.checks.iter().find(|c| c.id == "engine.version")
                     {
-                        ui.colored_label(
-                            level_color(engine_check.level),
-                            format!("엔진/CLI 버전: {}", engine_check.message),
-                        );
+                        ui.horizontal(|ui| {
+                            ui.colored_label(label_color, "엔진/CLI 버전:");
+                            ui.colored_label(
+                                level_color(engine_check.level),
+                                &engine_check.message,
+                            );
+                        });
+                        ui.add_space(4.0);
                     }
 
-                    // 수준별 개수 요약 표시
+                    // 수준별 개수 요약 줄
                     let errors = report.count(Level::Error);
                     let warns = report.count(Level::Warn);
                     let oks = report.count(Level::Ok);
                     let infos = report.count(Level::Info);
-                    ui.label(format!(
-                        "요약: 오류 {errors} · 경고 {warns} · 정상 {oks} · 정보 {infos}"
-                    ));
 
-                    // 펼치면 개별 점검 항목과 힌트를 모두 확인 가능
-                    egui::CollapsingHeader::new("항목별 점검 결과 보기")
-                        .default_open(errors > 0 || warns > 0)
-                        .show(ui, |ui| {
-                            for check in &report.checks {
-                                ui.colored_label(
-                                    level_color(check.level),
-                                    format!(
-                                        "[{}] {}: {}",
-                                        check.level.as_str().to_uppercase(),
-                                        check.id,
-                                        check.message
-                                    ),
-                                );
-                                if let Some(hint) = &check.hint {
-                                    ui.label(format!("    힌트: {hint}"));
+                    ui.horizontal(|ui| {
+                        ui.colored_label(level_color(Level::Error), format!("오류 {errors}"));
+                        ui.label("·");
+                        ui.colored_label(level_color(Level::Warn), format!("경고 {warns}"));
+                        ui.label("·");
+                        ui.colored_label(level_color(Level::Ok), format!("정상 {oks}"));
+                        ui.label("·");
+                        ui.colored_label(level_color(Level::Info), format!("참고 {infos}"));
+                    });
+                    ui.add_space(8.0);
+
+                    // ① 확인이 필요한 항목 (오류·경고) — 기본 노출
+                    let issues: Vec<_> = report
+                        .checks
+                        .iter()
+                        .filter(|c| matches!(c.level, Level::Error | Level::Warn))
+                        .collect();
+
+                    if issues.is_empty() {
+                        ui.colored_label(
+                            level_color(Level::Ok),
+                            "모든 필수 환경 점검을 통과했습니다.",
+                        );
+                    } else {
+                        ui.strong(format!("확인이 필요한 항목 ({})", issues.len()));
+                        ui.add_space(4.0);
+                        for check in &issues {
+                            let (tag, bg_color, border_color) = match check.level {
+                                Level::Error => (
+                                    "오류",
+                                    egui::Color32::from_rgb(254, 242, 242),
+                                    egui::Color32::from_rgb(235, 170, 175),
+                                ),
+                                _ => (
+                                    "경고",
+                                    egui::Color32::from_rgb(255, 250, 235),
+                                    egui::Color32::from_rgb(230, 200, 120),
+                                ),
+                            };
+
+                            egui::Frame::default()
+                                .fill(bg_color)
+                                .stroke(egui::Stroke::new(1.0, border_color))
+                                .corner_radius(egui::CornerRadius::same(4))
+                                .inner_margin(egui::Margin::symmetric(10, 6))
+                                .show(ui, |ui| {
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.colored_label(
+                                            level_color(check.level),
+                                            format!("[{tag}]"),
+                                        );
+                                        ui.strong(&check.message);
+                                        ui.colored_label(label_color, format!("({})", check.id));
+                                    });
+                                    if let Some(hint) = &check.hint {
+                                        ui.add_space(2.0);
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.colored_label(label_color, "해결:");
+                                            ui.monospace(hint);
+                                        });
+                                    }
+                                });
+                            ui.add_space(4.0);
+                        }
+                    }
+
+                    ui.add_space(4.0);
+
+                    // ② 참고 정보 (Info) — 기본 접힘
+                    let info_items: Vec<_> = report
+                        .checks
+                        .iter()
+                        .filter(|c| c.level == Level::Info)
+                        .collect();
+                    if !info_items.is_empty() {
+                        egui::CollapsingHeader::new(format!("참고 정보 ({})", info_items.len()))
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                for check in &info_items {
+                                    ui.label(format!("• {} ({})", check.message, check.id));
+                                    if let Some(hint) = &check.hint {
+                                        ui.colored_label(label_color, format!("   ↳ {hint}"));
+                                    }
                                 }
-                            }
-                        });
+                            });
+                    }
+
+                    // ③ 정상 통과 항목 (Ok) — 기본 접힘
+                    let ok_items: Vec<_> = report
+                        .checks
+                        .iter()
+                        .filter(|c| c.level == Level::Ok)
+                        .collect();
+                    if !ok_items.is_empty() {
+                        egui::CollapsingHeader::new(format!("정상 통과 항목 ({})", ok_items.len()))
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                for check in &ok_items {
+                                    ui.colored_label(
+                                        level_color(Level::Ok),
+                                        format!("✓ {} ({})", check.message, check.id),
+                                    );
+                                }
+                            });
+                    }
                 } else {
-                    ui.label("점검 결과를 불러오는 중입니다...");
+                    ui.colored_label(label_color, "점검 결과를 불러오는 중입니다...");
                 }
             });
-            ui.add_space(6.0);
+            ui.add_space(8.0);
 
             // 3) 포트 설정 및 모듈별 마지막 플래시 build_id (.dotbox/local.toml)
-            egui::Frame::group(ui.style()).show(ui, |ui| {
+            section_frame.show(ui, |ui| {
                 ui.strong("기기 및 플래시 상태 (.dotbox/local.toml)");
+                ui.add_space(6.0);
+
                 let ports = &opened.local_config.ports;
                 let flashed = &opened.local_config.flashed;
 
-                ui.label(format!(
-                    "왼쪽 모듈 — 포트: {} | 마지막 build_id: {}",
-                    ports.left.as_deref().unwrap_or("미지정"),
-                    flashed.left.as_deref().unwrap_or("기록 없음")
-                ));
-                ui.label(format!(
-                    "오른쪽 모듈 — 포트: {} | 마지막 build_id: {}",
-                    ports.right.as_deref().unwrap_or("미지정"),
-                    flashed.right.as_deref().unwrap_or("기록 없음")
-                ));
+                egui::Grid::new("overview_device_grid")
+                    .num_columns(2)
+                    .spacing([18.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.colored_label(label_color, "왼쪽 모듈");
+                        ui.monospace(format!(
+                            "포트: {}  |  build_id: {}",
+                            ports.left.as_deref().unwrap_or("미지정"),
+                            flashed.left.as_deref().unwrap_or("기록 없음")
+                        ));
+                        ui.end_row();
+
+                        ui.colored_label(label_color, "오른쪽 모듈");
+                        ui.monospace(format!(
+                            "포트: {}  |  build_id: {}",
+                            ports.right.as_deref().unwrap_or("미지정"),
+                            flashed.right.as_deref().unwrap_or("기록 없음")
+                        ));
+                        ui.end_row();
+                    });
 
                 // 좌/우 모듈에 구워진 이미지가 서로 다르면 경고 표시
                 if opened.local_config.flashed_mismatch() {
+                    ui.add_space(4.0);
                     ui.colored_label(
-                        egui::Color32::from_rgb(240, 200, 80),
+                        level_color(Level::Warn),
                         "경고: 왼쪽과 오른쪽 모듈의 마지막 플래시 build_id가 다릅니다.",
                     );
                 }
 
+                ui.add_space(6.0);
                 if ui.button("포트 설정으로 이동").clicked() {
-                    self.tabs.open(TabKind::ProjectSettings); // 설정 탭 열기
+                    self.tabs.open(TabKind::ProjectSettings);
                 }
             });
-            ui.add_space(6.0);
+            ui.add_space(8.0);
 
-            // 4) 에셋 상태 (5장 합의 전이므로 안내 표시)
-            egui::Frame::group(ui.style()).show(ui, |ui| {
+            // 4) 에셋 상태
+            section_frame.show(ui, |ui| {
                 ui.strong("에셋 상태");
-                ui.label(format!(
-                    "에셋 폴더: {}",
-                    opened.project.assets_dir().display()
-                ));
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.colored_label(label_color, "에셋 폴더:");
+                    ui.monospace(opened.project.assets_dir().display().to_string());
+                });
                 ui.colored_label(
-                    egui::Color32::from_gray(150),
+                    label_color,
                     "에셋 수와 검사 결과(assets::check)는 S2 에셋 형식 합의 후 표시됩니다.",
                 );
             });
@@ -3635,13 +3765,13 @@ fn show_serial_pane(
         });
 }
 
-// doctor 점검 수준별 표시 색상 반환
+// doctor 점검 수준별 표시 색상 반환 (라이트 테마 고대비)
 fn level_color(level: Level) -> egui::Color32 {
     match level {
-        Level::Ok => egui::Color32::from_rgb(120, 220, 140), // 정상: 초록
-        Level::Info => egui::Color32::from_rgb(160, 200, 240), // 정보: 하늘색
-        Level::Warn => egui::Color32::from_rgb(240, 200, 80), // 경고: 노랑
-        Level::Error => egui::Color32::from_rgb(240, 100, 100), // 오류: 빨강
+        Level::Ok => egui::Color32::from_rgb(22, 130, 62), // 정상: 짙은 초록
+        Level::Info => egui::Color32::from_rgb(29, 98, 178), // 정보: 짙은 파랑
+        Level::Warn => egui::Color32::from_rgb(176, 112, 0), // 경고: 짙은 황토색
+        Level::Error => egui::Color32::from_rgb(196, 36, 48), // 오류: 짙은 빨강
     }
 }
 
@@ -3786,6 +3916,57 @@ impl eframe::App for StudioApp {
     }
 }
 
+// GB Studio 스타일의 밝은 라이트 테마 (연회색 패널 + 순백색 위젯 + 로즈 마젠타 포인트)
+fn apply_studio_theme(ctx: &egui::Context) {
+    ctx.set_theme(egui::Theme::Light);
+    let mut style = (*ctx.style_of(egui::Theme::Light)).clone();
+
+    // 깔끔하고 정돈된 데스크톱 에디터 여백
+    style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+    style.spacing.button_padding = egui::vec2(10.0, 4.0);
+
+    let mut visuals = egui::Visuals::light();
+
+    // GB Studio 계열 밝은 무채색 배경 구성
+    visuals.panel_fill = egui::Color32::from_rgb(245, 245, 247); // 사이드바·기본 패널 (#F5F5F7)
+    visuals.window_fill = egui::Color32::from_rgb(255, 255, 255); // 팝업·모달 창 (#FFFFFF)
+    visuals.extreme_bg_color = egui::Color32::from_rgb(255, 255, 255); // 텍스트 입력칸 (#FFFFFF)
+    visuals.faint_bg_color = egui::Color32::from_rgb(236, 236, 240); // 표 줄무늬 배경
+
+    // 부드러운 4px 모서리
+    let radius = egui::CornerRadius::same(4);
+    visuals.widgets.noninteractive.corner_radius = radius;
+    visuals.widgets.inactive.corner_radius = radius;
+    visuals.widgets.hovered.corner_radius = radius;
+    visuals.widgets.active.corner_radius = radius;
+
+    // 1px 연회색 경계선 및 흰색 버튼 스타일
+    let border = egui::Color32::from_rgb(212, 212, 216); // #D4D4D8
+    let border_hover = egui::Color32::from_rgb(175, 175, 182);
+    let accent = egui::Color32::from_rgb(181, 35, 91); // GB Studio 시그니처 로즈 마젠타 (#B5235B)
+
+    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, border);
+    visuals.widgets.inactive.weak_bg_fill = egui::Color32::from_rgb(255, 255, 255);
+    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, border);
+
+    visuals.widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(242, 242, 245);
+    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, border_hover);
+
+    visuals.widgets.active.weak_bg_fill = accent;
+    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, accent);
+    visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+
+    // 선택된 탭·체크박스·강조 항목에 로즈 마젠타 적용
+    visuals.selection.bg_fill = accent;
+    visuals.selection.stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+
+    // 밝은 배경에서 선명하게 읽히는 짙은 차콜 본문 텍스트
+    visuals.override_text_color = Some(egui::Color32::from_rgb(44, 44, 46)); // #2C2C2E
+
+    style.visuals = visuals;
+    ctx.set_style_of(egui::Theme::Light, style);
+}
+
 // 프로그램 시작점 (실행 인자 `dotbox-studio [DIR]` 지원)
 fn main() -> eframe::Result {
     // 첫 번째 명령행 인자가 있으면 열 프로젝트 경로로 사용
@@ -3804,6 +3985,9 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "DotBox Studio",
         options,
-        Box::new(move |_cc| Ok(Box::new(StudioApp::new(initial_dir, settings)))),
+        Box::new(move |cc| {
+            apply_studio_theme(&cc.egui_ctx);
+            Ok(Box::new(StudioApp::new(initial_dir, settings)))
+        }),
     )
 }
